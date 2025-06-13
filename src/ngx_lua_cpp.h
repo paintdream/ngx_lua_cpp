@@ -137,7 +137,9 @@ namespace iris {
 		size_t get_hardware_concurrency() const noexcept;
 		// example async demo: sleep
 		coroutine_t<size_t> sleep(size_t milliseconds);
-		async_worker_t& get_async_worker() noexcept { return async_worker; }
+
+		bool set_async_worker(std::shared_ptr<async_worker_t> worker);
+		std::shared_ptr<async_worker_t> get_async_worker() noexcept { return async_worker; }
 
 	protected:
 		void process_events();
@@ -146,7 +148,7 @@ namespace iris {
 		friend struct ngx_hooker_t;
 
 	protected:
-		async_worker_t async_worker;
+		std::shared_ptr<async_worker_t> async_worker;
 		std::unique_ptr<warp_t> script_warp;
 		std::unique_ptr<warp_t::preempt_guard_t> script_warp_guard;
 		size_t main_thread_index = ~(size_t)0;

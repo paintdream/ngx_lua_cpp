@@ -438,9 +438,18 @@ namespace iris {
 		ngx_queue_t* ngx_posted_delayed_events = nullptr;
 	};
 
-	ngx_lua_cpp_t::ngx_lua_cpp_t() {
+	ngx_lua_cpp_t::ngx_lua_cpp_t() : async_worker(std::make_shared<async_worker_t>()) {
 		ngx_hooker_t::get_instance().insert(this);
 		reset_script_warp();
+	}
+
+	bool ngx_lua_cpp_t::set_async_worker(std::shared_ptr<async_worker_t> worker) {
+		if (is_running())
+			return false;
+
+		std::swap(async_worker, worker);
+		reset_script_warp();
+		return true;
 	}
 
 	void ngx_lua_cpp_t::reset_script_warp() {
@@ -448,7 +457,7 @@ namespace iris {
 			script_warp_guard.reset();
 		}
 
-		script_warp = std::make_unique<warp_t>(async_worker);
+		script_warp = std::make_unique<warp_t>(*async_worker);
 		script_warp_guard = std::make_unique<warp_t::preempt_guard_t>(*script_warp, 0);
 	}
 
@@ -473,11 +482,11 @@ namespace iris {
 			thread_count = std::thread::hardware_concurrency() * 4;
 		}
 
-		async_worker.resize(thread_count);
-		main_thread_index = async_worker.append(std::thread()); // for main thread polling
-		async_worker.start();
+		async_worker->resize(thread_count);
+		main_thread_index = async_worker->append(std::thread()); // for main thread polling
+		async_worker->start();
 
-		if (!script_warp->is_strand) {
+		if (!warp_t::is_strand) {
 			reset_script_warp();
 		}
 
@@ -494,25 +503,25 @@ namespace iris {
 	}
 
 	void ngx_lua_cpp_t::stop_impl() {
-		async_worker.terminate();
+		async_worker->terminate();
 
 		// manually polling events
-		async_worker.make_current(main_thread_index);
+		async_worker->make_current(main_thread_index);
 
-		while (!async_worker.join() || !script_warp->join([]() {
+		while (!async_worker->join() || !script_warp->join([]() {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			return false;
 		})) {}
 
-		async_worker.make_current(~(size_t)0);
+		async_worker->make_current(~(size_t)0);
 		main_thread_index = ~(size_t)0;
 
 		reset_script_warp();
-		async_worker.finalize();
+		async_worker->finalize();
 	}
 
 	bool ngx_lua_cpp_t::is_running() const noexcept {
-		return !async_worker.is_terminated();
+		return !async_worker->is_terminated();
 	}
 
 	coroutine_t<size_t> ngx_lua_cpp_t::sleep(size_t millseconds) {
@@ -537,12 +546,12 @@ namespace iris {
 	}
 
 	void ngx_lua_cpp_t::process_events() {
-		if (async_worker.get_thread_count() <= 1 || async_worker.is_terminated()) {
-			async_worker.make_current(main_thread_index);
+		if (async_worker->get_thread_count() <= 1 || async_worker->is_terminated()) {
+			async_worker->make_current(main_thread_index);
 			// if there is no worker threads, try polling from main_thread
-			while (!async_worker.poll()) {}
+			while (!async_worker->poll()) {}
 
-			async_worker.make_current(~(size_t)0);
+			async_worker->make_current(~(size_t)0);
 		}
 
 		while (!script_warp->join([]() { return true; })) {}
