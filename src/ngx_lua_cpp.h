@@ -55,13 +55,12 @@ namespace iris {
 #include "iris/iris_coroutine.h"
 
 namespace iris {
-	using async_worker_t = iris_async_worker_t<>;
-	struct warp_t : iris_warp_t<async_worker_t, false, warp_t> {
-		using base_t = iris_warp_t<async_worker_t, false, warp_t>;
+	struct ngx_warp_t : iris_warp_t<iris_async_worker_t<>, false, ngx_warp_t> {
+		using base_t = iris_warp_t<iris_async_worker_t<>, false, ngx_warp_t>;
 		template <typename... args_t>
-		warp_t(args_t&&... args) : base_t(std::forward<args_t>(args)...) {}
-		static warp_t* get_current() noexcept {
-			return static_cast<warp_t*>(base_t::get_current());
+		ngx_warp_t(args_t&&... args) : base_t(std::forward<args_t>(args)...) {}
+		static ngx_warp_t* get_current() noexcept {
+			return static_cast<ngx_warp_t*>(base_t::get_current());
 		}
 
 		void enter_warp() {}
@@ -80,15 +79,40 @@ namespace iris {
 		void flush_warp();
 	};
 
-	using lua_t = iris_lua_t;
-	template <typename return_t>
-	using coroutine_t = iris_coroutine_t<return_t>;
+	struct ngx_lua_cpp_t {
+	public:
+		ngx_lua_cpp_t();
+		~ngx_lua_cpp_t() noexcept;
+
+		static void lua_registar(iris_lua_t lua, iris_lua_traits_t<ngx_lua_cpp_t>);
+		iris_lua_t::optional_result_t<void> start(size_t thread_count);
+		iris_lua_t::optional_result_t<void> stop();
+		bool is_running() const noexcept;
+		size_t get_hardware_concurrency() const noexcept;
+		// example async demo: sleep
+		iris_coroutine_t<size_t> sleep(size_t milliseconds);
+
+		bool set_async_worker(std::shared_ptr<iris_async_worker_t<>> worker);
+		std::shared_ptr<iris_async_worker_t<>> get_async_worker() noexcept { return async_worker; }
+
+	protected:
+		void process_events();
+		void stop_impl();
+		void reset_script_warp();
+		friend struct ngx_hooker_t;
+
+	protected:
+		std::shared_ptr<iris_async_worker_t<>> async_worker;
+		std::unique_ptr<ngx_warp_t> script_warp;
+		std::unique_ptr<ngx_warp_t::preempt_guard_t> script_warp_guard;
+		size_t main_thread_index = ~(size_t)0;
+	};
 
 	template <typename>
 	struct is_non_void_iris_coroutine_instance : std::false_type {};
 
 	template <typename return_t>
-	struct is_non_void_iris_coroutine_instance<coroutine_t<return_t>> : std::bool_constant<!std::is_void_v<return_t>> {};
+	struct is_non_void_iris_coroutine_instance<iris_coroutine_t<return_t>> : std::bool_constant<!std::is_void_v<return_t>> {};
 
 	template <typename return_t>
 	struct is_coroutine_non_void_return_t : std::false_type {};
@@ -123,35 +147,6 @@ namespace iris {
 			lua_insert(L, -2);
 			lua_call(L, 1, 1);
 		}
-	};
-
-	struct ngx_lua_cpp_t {
-	public:
-		ngx_lua_cpp_t();
-		~ngx_lua_cpp_t() noexcept;
-
-		static void lua_registar(lua_t lua, iris_lua_traits_t<ngx_lua_cpp_t>);
-		lua_t::optional_result_t<void> start(size_t thread_count);
-		lua_t::optional_result_t<void> stop();
-		bool is_running() const noexcept;
-		size_t get_hardware_concurrency() const noexcept;
-		// example async demo: sleep
-		coroutine_t<size_t> sleep(size_t milliseconds);
-
-		bool set_async_worker(std::shared_ptr<async_worker_t> worker);
-		std::shared_ptr<async_worker_t> get_async_worker() noexcept { return async_worker; }
-
-	protected:
-		void process_events();
-		void stop_impl();
-		void reset_script_warp();
-		friend struct ngx_hooker_t;
-
-	protected:
-		std::shared_ptr<async_worker_t> async_worker;
-		std::unique_ptr<warp_t> script_warp;
-		std::unique_ptr<warp_t::preempt_guard_t> script_warp_guard;
-		size_t main_thread_index = ~(size_t)0;
 	};
 }
 

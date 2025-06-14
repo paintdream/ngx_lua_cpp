@@ -189,7 +189,7 @@ namespace iris {
 				"		return get_coroutine_returns(func(...))\n"
 				"	end\n"
 				"end\n";
-			lua.set_registry(static_cast<const void*>(&ngx_iris_wrap_coroutine_with_returns_key), lua.call<lua_t::ref_t>(lua.load(wrapper, "=(ngx_lua_cpp)"), &get_coroutine_returns));
+			lua.set_registry(static_cast<const void*>(&ngx_iris_wrap_coroutine_with_returns_key), lua.call<iris_lua_t::ref_t>(lua.load(wrapper, "=(ngx_lua_cpp)"), &get_coroutine_returns));
 
 			lua_State* L = lua.get_state();
 			lua_getglobal(L, "ngx");
@@ -438,12 +438,12 @@ namespace iris {
 		ngx_queue_t* ngx_posted_delayed_events = nullptr;
 	};
 
-	ngx_lua_cpp_t::ngx_lua_cpp_t() : async_worker(std::make_shared<async_worker_t>()) {
+	ngx_lua_cpp_t::ngx_lua_cpp_t() : async_worker(std::make_shared<iris_async_worker_t<>>()) {
 		ngx_hooker_t::get_instance().insert(this);
 		reset_script_warp();
 	}
 
-	bool ngx_lua_cpp_t::set_async_worker(std::shared_ptr<async_worker_t> worker) {
+	bool ngx_lua_cpp_t::set_async_worker(std::shared_ptr<iris_async_worker_t<>> worker) {
 		if (is_running())
 			return false;
 
@@ -457,8 +457,8 @@ namespace iris {
 			script_warp_guard.reset();
 		}
 
-		script_warp = std::make_unique<warp_t>(*async_worker);
-		script_warp_guard = std::make_unique<warp_t::preempt_guard_t>(*script_warp, 0);
+		script_warp = std::make_unique<ngx_warp_t>(*async_worker);
+		script_warp_guard = std::make_unique<ngx_warp_t::preempt_guard_t>(*script_warp, 0);
 	}
 
 	ngx_lua_cpp_t::~ngx_lua_cpp_t() noexcept {
@@ -469,13 +469,13 @@ namespace iris {
 		ngx_hooker_t::get_instance().remove(this);
 	}
 
-	lua_t::optional_result_t<void> ngx_lua_cpp_t::start(size_t thread_count) {
-		if (async_worker_t::get_current_thread_index() != ~(size_t)0) {
-			return lua_t::result_error_t("ngx_lua_cpp_t::start(thread_count) -> incorrect current thread, please call me in main thread.");
+	iris_lua_t::optional_result_t<void> ngx_lua_cpp_t::start(size_t thread_count) {
+		if (iris_async_worker_t<>::get_current_thread_index() != ~(size_t)0) {
+			return iris_lua_t::result_error_t("ngx_lua_cpp_t::start(thread_count) -> incorrect current thread, please call me in main thread.");
 		}
 
 		if (is_running()) {
-			return lua_t::result_error_t("ngx_lua_cpp_t::start(thread_count) -> already started.");
+			return iris_lua_t::result_error_t("ngx_lua_cpp_t::start(thread_count) -> already started.");
 		}
 
 		if (thread_count > std::thread::hardware_concurrency() * 4) {
@@ -486,16 +486,16 @@ namespace iris {
 		main_thread_index = async_worker->append(std::thread()); // for main thread polling
 		async_worker->start();
 
-		if (!warp_t::is_strand) {
+		if (!ngx_warp_t::is_strand) {
 			reset_script_warp();
 		}
 
 		return {};
 	}
 
-	lua_t::optional_result_t<void> ngx_lua_cpp_t::stop() {
+	iris_lua_t::optional_result_t<void> ngx_lua_cpp_t::stop() {
 		if (!is_running()) {
-			return lua_t::result_error_t("ngx_lua_cpp_t::stop() -> not started.");
+			return iris_lua_t::result_error_t("ngx_lua_cpp_t::stop() -> not started.");
 		}
 
 		stop_impl();
@@ -524,8 +524,8 @@ namespace iris {
 		return !async_worker->is_terminated();
 	}
 
-	coroutine_t<size_t> ngx_lua_cpp_t::sleep(size_t millseconds) {
-		warp_t* current = co_await iris_switch<warp_t>(nullptr);
+	iris_coroutine_t<size_t> ngx_lua_cpp_t::sleep(size_t millseconds) {
+		ngx_warp_t* current = co_await iris_switch<ngx_warp_t>(nullptr);
 		std::this_thread::sleep_for(std::chrono::milliseconds(millseconds));
 		co_await iris_switch(current);
 		co_return std::move(millseconds);
@@ -535,7 +535,7 @@ namespace iris {
 		return std::thread::hardware_concurrency();
 	}
 
-	void ngx_lua_cpp_t::lua_registar(lua_t lua, iris_lua_traits_t<ngx_lua_cpp_t>) {
+	void ngx_lua_cpp_t::lua_registar(iris_lua_t lua, iris_lua_traits_t<ngx_lua_cpp_t>) {
 		ngx_hooker_t::get_instance().registar(lua);
 
 		lua.set_current<&ngx_lua_cpp_t::start>("start");
@@ -557,7 +557,7 @@ namespace iris {
 		while (!script_warp->join([]() { return true; })) {}
 	}
 
-	void warp_t::flush_warp() {
+	void ngx_warp_t::flush_warp() {
 		ngx_hooker_t::get_instance().notify();
 	}
 
@@ -571,7 +571,7 @@ namespace iris {
 }
 
 extern "C" NGX_LUA_CPP_API int luaopen_ngx_lua_cpp(lua_State* L) {
-	return iris::lua_t::forward(L, [](iris::lua_t lua) {
+	return iris::iris_lua_t::forward(L, [](iris::iris_lua_t lua) {
 		return lua.make_type<iris::ngx_lua_cpp_t>("ngx_lua_cpp");
 	});
 }
