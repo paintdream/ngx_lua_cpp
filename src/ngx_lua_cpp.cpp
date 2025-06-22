@@ -470,7 +470,7 @@ namespace iris {
 	}
 
 	iris_lua_t::optional_result_t<void> ngx_lua_cpp_t::start(size_t thread_count) {
-		if (iris_async_worker_t<>::get_current_thread_index() != ~(size_t)0) {
+		if (async_worker->get_current_thread_index() != ~(size_t)0) {
 			return iris_lua_t::result_error_t("ngx_lua_cpp_t::start(thread_count) -> incorrect current thread, please call me in main thread.");
 		}
 
@@ -543,6 +543,18 @@ namespace iris {
 		lua.set_current<&ngx_lua_cpp_t::is_running>("is_running");
 		lua.set_current<&ngx_lua_cpp_t::get_hardware_concurrency>("get_hardware_concurrency");
 		lua.set_current<&ngx_lua_cpp_t::sleep>("sleep");
+
+		lua.set_current("get_async_worker_unsafe", [](ngx_lua_cpp_t& self) {
+			return reinterpret_cast<void*>(&self.async_worker);
+		});
+
+		lua.set_current("set_async_worker_unsafe", [](iris_lua_t lua, ngx_lua_cpp_t& self, void* ptr) {
+			if (ptr == nullptr) {
+				luaL_error(lua.get_state(), "Unable to extract async_worker's ptr");
+			}
+
+			return self.set_async_worker(*reinterpret_cast<std::shared_ptr<iris_async_worker_t<>>*>(ptr));
+		});
 	}
 
 	void ngx_lua_cpp_t::process_events() {
