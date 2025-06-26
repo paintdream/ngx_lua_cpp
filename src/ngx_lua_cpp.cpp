@@ -440,25 +440,16 @@ namespace iris {
 
 	ngx_lua_cpp_t::ngx_lua_cpp_t() : async_worker(std::make_shared<iris_async_worker_t<>>()) {
 		ngx_hooker_t::get_instance().insert(this);
-		reset_script_warp();
+		reset_main_warp();
 	}
 
-	bool ngx_lua_cpp_t::set_async_worker(std::shared_ptr<iris_async_worker_t<>> worker) {
-		if (is_running())
-			return false;
-
-		std::swap(async_worker, worker);
-		reset_script_warp();
-		return true;
-	}
-
-	void ngx_lua_cpp_t::reset_script_warp() {
-		if (script_warp_guard) {
-			script_warp_guard.reset();
+	void ngx_lua_cpp_t::reset_main_warp() {
+		if (main_warp_guard) {
+			main_warp_guard.reset();
 		}
 
-		script_warp = std::make_unique<ngx_warp_t>(*async_worker);
-		script_warp_guard = std::make_unique<ngx_warp_t::preempt_guard_t>(*script_warp, 0);
+		main_warp = std::make_unique<ngx_warp_t>(*async_worker);
+		main_warp_guard = std::make_unique<ngx_warp_t::preempt_guard_t>(*main_warp, 0);
 	}
 
 	ngx_lua_cpp_t::~ngx_lua_cpp_t() noexcept {
@@ -487,7 +478,7 @@ namespace iris {
 		async_worker->start();
 
 		if (!ngx_warp_t::is_strand) {
-			reset_script_warp();
+			reset_main_warp();
 		}
 
 		return {};
@@ -508,7 +499,7 @@ namespace iris {
 		// manually polling events
 		async_worker->make_current(main_thread_index);
 
-		while (!async_worker->join() || !script_warp->join([]() {
+		while (!async_worker->join() || !main_warp->join([]() {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			return false;
 		})) {}
@@ -516,7 +507,7 @@ namespace iris {
 		async_worker->make_current(~(size_t)0);
 		main_thread_index = ~(size_t)0;
 
-		reset_script_warp();
+		reset_main_warp();
 		async_worker->finalize();
 	}
 
@@ -544,17 +535,46 @@ namespace iris {
 		lua.set_current<&ngx_lua_cpp_t::get_hardware_concurrency>("get_hardware_concurrency");
 		lua.set_current<&ngx_lua_cpp_t::sleep>("sleep");
 
-		lua.set_current("get_async_worker_unsafe", [](ngx_lua_cpp_t& self) {
-			return reinterpret_cast<void*>(&self.async_worker);
-		});
+		lua.set_current<&ngx_lua_cpp_t::__inspect__>("__inspect__");
+	}
 
-		lua.set_current("set_async_worker_unsafe", [](iris_lua_t lua, ngx_lua_cpp_t& self, void* ptr) {
-			if (ptr == nullptr) {
-				luaL_error(lua.get_state(), "Unable to extract async_worker's ptr");
-			}
+	iris_lua_t::optional_result_t<iris_lua_t::ref_t> ngx_lua_cpp_t::__inspect__(iris_lua_t&& lua) {
+		if (is_running()) {
+			return iris_lua_t::result_error_t("__inspect__ can't be called while running!");
+		}
 
-			return self.set_async_worker(*reinterpret_cast<std::shared_ptr<iris_async_worker_t<>>*>(ptr));
+		return lua.make_table([this](iris_lua_t&& lua) {
+			lua.set_current("async_worker", reinterpret_cast<void*>(&async_worker));
+			lua.set_current("context", reinterpret_cast<void*>(this));
+			lua.set_current("native_post_main", reinterpret_cast<void*>(&ngx_lua_cpp_t::native_post_main));
+			lua.set_current("native_set_async_worker", reinterpret_cast<void*>(&ngx_lua_cpp_t::native_set_async_worker));
+			lua.set_current("main_warp", reinterpret_cast<void*>(&main_warp));
 		});
+	}
+
+	void ngx_lua_cpp_t::native_post_main(void* context, iris_async_worker_t<>::task_base_t* task) {
+		ngx_lua_cpp_t* self = reinterpret_cast<ngx_lua_cpp_t*>(context);
+		if (self != nullptr) {
+			self->main_warp->queue_routine([self, task]() {
+				self->async_worker->execute_task(task);
+			});
+		}
+	}
+
+	void ngx_lua_cpp_t::native_set_async_worker(void* context, void* async_worker_ptr) {
+		ngx_lua_cpp_t* self = reinterpret_cast<ngx_lua_cpp_t*>(context);
+		if (self != nullptr && !self->is_running()) {
+			self->set_async_worker(*reinterpret_cast<std::shared_ptr<iris_async_worker_t<>>*>(async_worker_ptr));
+		}
+	}
+
+	bool ngx_lua_cpp_t::set_async_worker(std::shared_ptr<iris_async_worker_t<>> worker) {
+		if (is_running())
+			return false;
+
+		std::swap(async_worker, worker);
+		reset_main_warp();
+		return true;
 	}
 
 	void ngx_lua_cpp_t::process_events() {
@@ -566,7 +586,7 @@ namespace iris {
 			async_worker->make_current(~(size_t)0);
 		}
 
-		while (!script_warp->join([]() { return true; })) {}
+		while (!main_warp->join([]() { return true; })) {}
 	}
 
 	void ngx_warp_t::flush_warp() {

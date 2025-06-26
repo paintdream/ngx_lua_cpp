@@ -91,20 +91,25 @@ namespace iris {
 		size_t get_hardware_concurrency() const noexcept;
 		// example async demo: sleep
 		iris_coroutine_t<size_t> sleep(size_t milliseconds);
-
-		bool set_async_worker(std::shared_ptr<iris_async_worker_t<>> worker);
 		std::shared_ptr<iris_async_worker_t<>> get_async_worker() noexcept { return async_worker; }
+		
+		// inspect internal functions
+		iris_lua_t::optional_result_t<iris_lua_t::ref_t> __inspect__(iris_lua_t&& lua);
 
 	protected:
+		bool set_async_worker(std::shared_ptr<iris_async_worker_t<>> worker);
+		static void native_post_main(void* context, iris_async_worker_t<>::task_base_t* task);
+		static void native_set_async_worker(void* context, void* async_worker_ptr);
+
 		void process_events();
 		void stop_impl();
-		void reset_script_warp();
+		void reset_main_warp();
 		friend struct ngx_hooker_t;
 
 	protected:
 		std::shared_ptr<iris_async_worker_t<>> async_worker;
-		std::unique_ptr<ngx_warp_t> script_warp;
-		std::unique_ptr<ngx_warp_t::preempt_guard_t> script_warp_guard;
+		std::unique_ptr<ngx_warp_t> main_warp;
+		std::unique_ptr<ngx_warp_t::preempt_guard_t> main_warp_guard;
 		size_t main_thread_index = ~(size_t)0;
 	};
 
