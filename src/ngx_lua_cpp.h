@@ -93,14 +93,11 @@ namespace iris {
 		iris_coroutine_t<size_t> sleep(size_t milliseconds);
 		std::shared_ptr<iris_async_worker_t<>> get_async_worker() noexcept { return async_worker; }
 		
-		// inspect internal functions
-		iris_lua_t::optional_result_t<iris_lua_t::ref_t> __inspect__(iris_lua_t&& lua);
+		// inspect internal
+		void* __async_worker__(void* new_async_worker_ptr);
 
 	protected:
 		bool set_async_worker(std::shared_ptr<iris_async_worker_t<>> worker);
-		static void native_post_main(void* context, iris_async_worker_t<>::task_base_t* task);
-		static void native_set_async_worker(void* context, void* async_worker_ptr);
-
 		void process_events();
 		void stop_impl();
 		void reset_main_warp();

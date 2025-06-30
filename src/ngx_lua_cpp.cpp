@@ -441,6 +441,14 @@ namespace iris {
 	ngx_lua_cpp_t::ngx_lua_cpp_t() : async_worker(std::make_shared<iris_async_worker_t<>>()) {
 		ngx_hooker_t::get_instance().insert(this);
 		reset_main_warp();
+
+		async_worker->set_priority_task_handler([this](iris_async_worker_t<>::task_base_t* task, size_t& priority) {
+			main_warp->queue_routine([this, task]() {
+				async_worker->execute_task(task);
+			});
+
+			return true;
+		});
 	}
 
 	void ngx_lua_cpp_t::reset_main_warp() {
@@ -535,36 +543,14 @@ namespace iris {
 		lua.set_current<&ngx_lua_cpp_t::get_hardware_concurrency>("get_hardware_concurrency");
 		lua.set_current<&ngx_lua_cpp_t::sleep>("sleep");
 
-		lua.set_current<&ngx_lua_cpp_t::__inspect__>("__inspect__");
+		lua.set_current<&ngx_lua_cpp_t::__async_worker__>("__async_worker__");
 	}
 
-	iris_lua_t::optional_result_t<iris_lua_t::ref_t> ngx_lua_cpp_t::__inspect__(iris_lua_t&& lua) {
-		if (is_running()) {
-			return iris_lua_t::result_error_t("__inspect__ can't be called while running!");
-		}
-
-		return lua.make_table([this](iris_lua_t&& lua) {
-			lua.set_current("async_worker", reinterpret_cast<void*>(&async_worker));
-			lua.set_current("context", reinterpret_cast<void*>(this));
-			lua.set_current("native_post_main", reinterpret_cast<void*>(&ngx_lua_cpp_t::native_post_main));
-			lua.set_current("native_set_async_worker", reinterpret_cast<void*>(&ngx_lua_cpp_t::native_set_async_worker));
-			lua.set_current("main_warp", reinterpret_cast<void*>(&main_warp));
-		});
-	}
-
-	void ngx_lua_cpp_t::native_post_main(void* context, iris_async_worker_t<>::task_base_t* task) {
-		ngx_lua_cpp_t* self = reinterpret_cast<ngx_lua_cpp_t*>(context);
-		if (self != nullptr) {
-			self->main_warp->queue_routine([self, task]() {
-				self->async_worker->execute_task(task);
-			});
-		}
-	}
-
-	void ngx_lua_cpp_t::native_set_async_worker(void* context, void* async_worker_ptr) {
-		ngx_lua_cpp_t* self = reinterpret_cast<ngx_lua_cpp_t*>(context);
-		if (self != nullptr && !self->is_running()) {
-			self->set_async_worker(*reinterpret_cast<std::shared_ptr<iris_async_worker_t<>>*>(async_worker_ptr));
+	void* ngx_lua_cpp_t::__async_worker__(void* new_async_worker_ptr) {
+		if (new_async_worker_ptr != nullptr && set_async_worker(*reinterpret_cast<std::shared_ptr<iris_async_worker_t<>>*>(new_async_worker_ptr))) {
+			return new_async_worker_ptr;
+		} else {
+			return reinterpret_cast<void*>(&async_worker);
 		}
 	}
 
