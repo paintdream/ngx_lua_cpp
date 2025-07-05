@@ -567,8 +567,7 @@ namespace iris {
 		if (async_worker->get_thread_count() <= 1 || async_worker->is_terminated()) {
 			async_worker->make_current(main_thread_index);
 			// if there is no worker threads, try polling from main_thread
-			while (!async_worker->poll()) {}
-
+			while (async_worker->poll()) {}
 			async_worker->make_current(~(size_t)0);
 		}
 
