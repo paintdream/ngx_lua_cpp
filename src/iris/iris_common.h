@@ -259,6 +259,36 @@ namespace iris {
 		return ret;
 	}
 
+	template <typename return_t>
+	constexpr auto iris_overload_cast(return_t (*ptr)()) {
+		return ptr;
+	}
+
+	template <typename return_t, typename... args_t>
+	constexpr auto iris_overload_cast(return_t (*ptr)(args_t...)) {
+		return ptr;
+	}
+
+	template <typename return_t, typename... args_t, typename type_t>
+	constexpr auto iris_overload_cast(return_t (type_t::*ptr)(args_t...)) {
+		return ptr;
+	}
+
+	template <typename return_t, typename type_t>
+	constexpr auto iris_overload_cast(return_t (type_t::*ptr)()) {
+		return ptr;
+	}
+
+	template <typename return_t, typename... args_t, typename type_t>
+	constexpr auto iris_overload_cast(return_t (type_t::*ptr)(args_t...) const) {
+		return ptr;
+	}
+
+	template <typename return_t, typename type_t>
+	constexpr auto iris_overload_cast(return_t (type_t::*ptr)() const) {
+		return ptr;
+	}
+
 	// static variable provider template
 	template <typename type_t>
 	struct iris_static_instance_base_t {

@@ -584,7 +584,7 @@ namespace iris {
 
 extern "C" NGX_LUA_CPP_API int luaopen_ngx_lua_cpp(lua_State* L) {
 	return iris::iris_lua_t::forward(L, [](iris::iris_lua_t lua) {
-		return lua.make_type<iris::ngx_lua_cpp_t>("ngx_lua_cpp");
+		return lua.make_type<iris::ngx_lua_cpp_t>();
 	});
 }
 
