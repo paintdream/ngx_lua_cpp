@@ -142,7 +142,7 @@ namespace iris {
 		static constexpr bool value = true;
 
 		template <auto ptr, typename executor_t, typename... args_t>
-		static void to_lua(lua_State* L, std::nullptr_t, executor_t&& executor, args_t&&... args) {
+		static void lua_tostack(lua_State* L, std::nullptr_t, executor_t&& executor, args_t&&... args) {
 			executor(L, std::forward<args_t>(args)...);
 			lua_pushlightuserdata(L, &ngx_iris_wrap_coroutine_with_returns_key);
 			lua_rawget(L, LUA_REGISTRYINDEX);
