@@ -532,6 +532,7 @@ namespace iris {
 	void ngx_lua_cpp_t::lua_registar(iris_lua_t lua, iris_lua_traits_t<ngx_lua_cpp_t>) {
 		ngx_hooker_t::get_instance().registar(lua);
 
+		lua.set_current_new<&iris_lua_t::place_new_object<ngx_lua_cpp_t>>("new");
 		lua.set_current<&ngx_lua_cpp_t::start>("start");
 		lua.set_current<&ngx_lua_cpp_t::stop>("stop");
 		lua.set_current<&ngx_lua_cpp_t::is_running>("is_running");
@@ -583,7 +584,7 @@ namespace iris {
 }
 
 extern "C" NGX_LUA_CPP_API int luaopen_ngx_lua_cpp(lua_State* L) {
-	return iris::iris_lua_t::forward(L, [](iris::iris_lua_t lua) {
+	return iris::iris_lua_t::forward(L, +[](iris::iris_lua_t lua) {
 		return lua.make_type<iris::ngx_lua_cpp_t>();
 	});
 }
