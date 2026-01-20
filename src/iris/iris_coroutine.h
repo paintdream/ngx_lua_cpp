@@ -5,7 +5,7 @@ This software is a C++ 20 Header-Only reimplementation of core part from project
 
 The MIT License (MIT)
 
-Copyright (c) 2014-2025 PaintDream
+Copyright (c) 2014-2026 PaintDream
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -91,8 +91,7 @@ namespace iris {
 		iris_coroutine_t& operator = (const iris_coroutine_t& rhs) = delete;
 		iris_coroutine_t& operator = (iris_coroutine_t&& rhs) noexcept {
 			if (this != &rhs) {
-				std::swap(handle, rhs.handle);
-				rhs.handle = std::coroutine_handle<promise_type>();
+				handle = std::exchange(rhs.handle, std::coroutine_handle<promise_type>());
 			}
 
 			return *this;
