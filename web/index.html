@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ngx_lua_cpp Debug Console</title>
+<style>
+:root {
+    --bg-primary: #1e1e2e;
+    --bg-secondary: #181825;
+    --bg-surface: #313244;
+    --bg-hover: #45475a;
+    --text-primary: #cdd6f4;
+    --text-secondary: #a6adc8;
+    --text-muted: #6c7086;
+    --accent: #89b4fa;
+    --accent-hover: #74c7ec;
+    --green: #a6e3a1;
+    --red: #f38ba8;
+    --yellow: #f9e2af;
+    --border: #45475a;
+    --scrollbar: #585b70;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* Header */
+.header {
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+}
+
+.header-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+.header-title .logo {
+    font-size: 18px;
+}
+
+.header-info {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    display: inline-block;
+    margin-right: 4px;
+}
+
+.status-dot.offline {
+    background: var(--red);
+}
+
+/* Main layout */
+.main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+}
+
+/* Panels */
+.panel {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.panel-left {
+    flex: 1;
+    border-right: 1px solid var(--border);
+    min-width: 0;
+}
+
+.panel-right {
+    flex: 1;
+    min-width: 0;
+}
+
+.panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+.panel-header h2 {
+    font-size: 13px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.panel-actions {
+    display: flex;
+    gap: 4px;
+}
+
+/* Buttons */
+.btn {
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    font-size: 12px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    transition: background 0.15s;
+}
+
+.btn:hover {
+    background: var(--bg-hover);
+}
+
+.btn-primary {
+    background: var(--accent);
+    color: var(--bg-primary);
+    border-color: var(--accent);
+    font-weight: 600;
+}
+
+.btn-primary:hover {
+    background: var(--accent-hover);
+}
+
+.btn-danger {
+    border-color: var(--red);
+    color: var(--red);
+}
+
+.btn-danger:hover {
+    background: rgba(243, 139, 168, 0.15);
+}
+
+/* Code editor */
+.editor-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.code-editor {
+    flex: 1;
+    width: 100%;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: none;
+    padding: 12px;
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    resize: none;
+    outline: none;
+    tab-size: 4;
+}
+
+.code-editor::placeholder {
+    color: var(--text-muted);
+}
+
+/* Output */
+.output-container {
+    border-top: 1px solid var(--border);
+    max-height: 40%;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+}
+
+.output-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+.output-header h3 {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.output-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 12px;
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    background: var(--bg-secondary);
+    min-height: 80px;
+}
+
+.output-entry {
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+}
+
+.output-entry:last-child {
+    border-bottom: none;
+}
+
+.output-entry .timestamp {
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+.output-entry .result {
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.output-entry .result.success {
+    color: var(--green);
+}
+
+.output-entry .result.error {
+    color: var(--red);
+}
+
+.output-entry .code-preview {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-bottom: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Log viewer */
+.log-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.log-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+.log-controls label {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.log-controls select,
+.log-controls input[type="number"] {
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    font-size: 12px;
+    outline: none;
+}
+
+.log-controls input[type="number"] {
+    width: 60px;
+}
+
+.log-controls .auto-refresh {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.log-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 12px;
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+}
+
+.log-line {
+    padding: 1px 0;
+}
+
+.log-line.level-error,
+.log-line.level-crit,
+.log-line.level-emerg,
+.log-line.level-alert {
+    color: var(--red);
+}
+
+.log-line.level-warn {
+    color: var(--yellow);
+}
+
+.log-line.level-notice,
+.log-line.level-info {
+    color: var(--text-primary);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--scrollbar);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--text-muted);
+}
+
+/* Keyboard shortcut hint */
+.shortcut-hint {
+    font-size: 11px;
+    color: var(--text-muted);
+    padding: 4px 12px;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .main {
+        flex-direction: column;
+    }
+
+    .panel-left {
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+    }
+}
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+    <div class="header-title">
+        <span class="logo">&#9881;</span>
+        <span>ngx_lua_cpp Debug Console</span>
+    </div>
+    <div class="header-info">
+        <span id="server-status"><span class="status-dot offline"></span>Connecting...</span>
+        <span id="server-info"></span>
+    </div>
+</div>
+
+<!-- Main -->
+<div class="main">
+    <!-- Left panel: Lua Terminal -->
+    <div class="panel panel-left">
+        <div class="panel-header">
+            <h2>&#9654; Lua Terminal</h2>
+            <div class="panel-actions">
+                <button class="btn" onclick="clearEditor()" title="Clear editor">Clear</button>
+                <button class="btn btn-primary" onclick="executeCode()" title="Run code (Ctrl+Enter)">&#9654; Run</button>
+            </div>
+        </div>
+        <div class="editor-container">
+            <textarea id="code-editor" class="code-editor" placeholder="-- Enter Lua code here...&#10;-- Press Ctrl+Enter to execute&#10;-- Examples:&#10;--   print('Hello from ngx_lua_cpp!')&#10;--   print(ngx.config.nginx_version)&#10;--   local inst = require('init_ngx_lua_cpp')&#10;--   print('Running: ' .. tostring(inst:is_running()))" spellcheck="false"></textarea>
+        </div>
+        <div class="shortcut-hint">
+            Ctrl+Enter to run &middot; Ctrl+L to clear output &middot; Tab to indent
+        </div>
+        <div class="output-container">
+            <div class="output-header">
+                <h3>Output</h3>
+                <button class="btn" onclick="clearOutput()" title="Clear output (Ctrl+L)" style="padding: 2px 6px; font-size: 11px;">Clear</button>
+            </div>
+            <div id="output-content" class="output-content">
+                <span style="color: var(--text-muted);">Output will appear here...</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Right panel: Log Viewer -->
+    <div class="panel panel-right">
+        <div class="panel-header">
+            <h2>&#128220; Server Logs</h2>
+            <div class="panel-actions">
+                <button class="btn btn-danger" onclick="clearLogs()" title="Clear log file">Clear Logs</button>
+                <button class="btn" onclick="fetchLogs()" title="Refresh logs">&#8635; Refresh</button>
+            </div>
+        </div>
+        <div class="log-controls">
+            <label for="log-type">Type:</label>
+            <select id="log-type" onchange="fetchLogs()">
+                <option value="error">Error Log</option>
+                <option value="access">Access Log</option>
+            </select>
+            <label for="log-lines">Lines:</label>
+            <input type="number" id="log-lines" value="200" min="10" max="10000" onchange="fetchLogs()">
+            <div class="auto-refresh">
+                <input type="checkbox" id="auto-refresh" onchange="toggleAutoRefresh()">
+                <label for="auto-refresh">Auto-refresh (5s)</label>
+            </div>
+        </div>
+        <div class="log-container">
+            <div id="log-content" class="log-content">Loading logs...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+// ---- State ----
+let autoRefreshTimer = null;
+let outputEntries = [];
+
+// ---- Code Execution ----
+async function executeCode() {
+    const editor = document.getElementById('code-editor');
+    const code = editor.value.trim();
+    if (!code) return;
+
+    const entry = {
+        timestamp: new Date().toLocaleTimeString(),
+        code: code
+    };
+
+    try {
+        const resp = await fetch('/api/exec', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({code: code})
+        });
+        const data = await resp.json();
+
+        let parts = [];
+        if (data.output) parts.push(data.output);
+        if (data.result !== undefined && data.result !== null) {
+            parts.push('=> ' + data.result);
+        }
+
+        if (data.ok) {
+            entry.result = parts.join('\n') || '(no output)';
+            entry.success = true;
+        } else {
+            entry.result = data.error || 'Unknown error';
+            if (data.output) {
+                entry.result = data.output + '\n' + entry.result;
+            }
+            entry.success = false;
+        }
+    } catch (err) {
+        entry.result = 'Network error: ' + err.message;
+        entry.success = false;
+    }
+
+    outputEntries.unshift(entry);
+    renderOutput();
+}
+
+function renderOutput() {
+    const container = document.getElementById('output-content');
+    if (outputEntries.length === 0) {
+        container.innerHTML = '<span style="color: var(--text-muted);">Output will appear here...</span>';
+        return;
+    }
+
+    container.innerHTML = outputEntries.map(function(entry) {
+        const codePreview = entry.code.split('\n')[0].substring(0, 80);
+        const cls = entry.success ? 'success' : 'error';
+        return '<div class="output-entry">' +
+            '<span class="timestamp">' + escapeHtml(entry.timestamp) + '</span> ' +
+            '<span class="code-preview">' + escapeHtml(codePreview) + '</span>' +
+            '<div class="result ' + cls + '">' + escapeHtml(entry.result) + '</div>' +
+            '</div>';
+    }).join('');
+}
+
+function clearOutput() {
+    outputEntries = [];
+    renderOutput();
+}
+
+function clearEditor() {
+    document.getElementById('code-editor').value = '';
+    document.getElementById('code-editor').focus();
+}
+
+// ---- Log Viewer ----
+async function fetchLogs() {
+    const logType = document.getElementById('log-type').value;
+    const lines = document.getElementById('log-lines').value;
+    const container = document.getElementById('log-content');
+
+    try {
+        const resp = await fetch('/api/logs?type=' + logType + '&lines=' + lines);
+        const data = await resp.json();
+
+        if (data.ok) {
+            if (!data.content || data.content.trim() === '') {
+                container.innerHTML = '<span style="color: var(--text-muted);">Log is empty.</span>';
+            } else {
+                container.innerHTML = data.content.split('\n').map(function(line) {
+                    return '<div class="log-line ' + getLogLevelClass(line) + '">' + escapeHtml(line) + '</div>';
+                }).join('');
+                container.scrollTop = container.scrollHeight;
+            }
+        } else {
+            container.innerHTML = '<span style="color: var(--red);">Error: ' + escapeHtml(data.error) + '</span>';
+        }
+    } catch (err) {
+        container.innerHTML = '<span style="color: var(--red);">Failed to fetch logs: ' + escapeHtml(err.message) + '</span>';
+    }
+}
+
+async function clearLogs() {
+    if (!confirm('Clear the log file? This cannot be undone.')) return;
+
+    const logType = document.getElementById('log-type').value;
+
+    try {
+        const resp = await fetch('/api/logs/clear?type=' + logType);
+        const data = await resp.json();
+        if (data.ok) {
+            fetchLogs();
+        } else {
+            alert('Failed to clear logs: ' + data.error);
+        }
+    } catch (err) {
+        alert('Network error: ' + err.message);
+    }
+}
+
+function toggleAutoRefresh() {
+    const checked = document.getElementById('auto-refresh').checked;
+    if (checked) {
+        fetchLogs();
+        autoRefreshTimer = setInterval(fetchLogs, 5000);
+    } else {
+        if (autoRefreshTimer) {
+            clearInterval(autoRefreshTimer);
+            autoRefreshTimer = null;
+        }
+    }
+}
+
+function getLogLevelClass(line) {
+    if (line.indexOf('] emerg') !== -1) return 'level-emerg';
+    if (line.indexOf('] alert') !== -1) return 'level-alert';
+    if (line.indexOf('] crit') !== -1) return 'level-crit';
+    if (line.indexOf('] error') !== -1) return 'level-error';
+    if (line.indexOf('] warn') !== -1) return 'level-warn';
+    if (line.indexOf('] notice') !== -1) return 'level-notice';
+    if (line.indexOf('] info') !== -1) return 'level-info';
+    return '';
+}
+
+// ---- Server Info ----
+async function fetchServerInfo() {
+    try {
+        const resp = await fetch('/api/info');
+        const data = await resp.json();
+        if (data.ok) {
+            const statusEl = document.getElementById('server-status');
+            statusEl.innerHTML = '<span class="status-dot"></span>Connected';
+
+            const parts = ['nginx/' + data.nginx_version];
+            if (data.ngx_lua_cpp) {
+                parts.push('ngx_lua_cpp: ' + (data.ngx_lua_cpp_running ? 'running' : 'stopped'));
+            }
+            parts.push('PID: ' + data.worker_pid);
+            document.getElementById('server-info').textContent = parts.join(' | ');
+        }
+    } catch (err) {
+        const statusEl = document.getElementById('server-status');
+        statusEl.innerHTML = '<span class="status-dot offline"></span>Disconnected';
+    }
+}
+
+// ---- Utilities ----
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.appendChild(document.createTextNode(text));
+    return div.innerHTML;
+}
+
+// ---- Keyboard Shortcuts ----
+document.getElementById('code-editor').addEventListener('keydown', function(e) {
+    // Ctrl+Enter to execute
+    if (e.ctrlKey && e.key === 'Enter') {
+        e.preventDefault();
+        executeCode();
+        return;
+    }
+
+    // Tab to indent
+    if (e.key === 'Tab') {
+        e.preventDefault();
+        const start = this.selectionStart;
+        const end = this.selectionEnd;
+        this.value = this.value.substring(0, start) + '\t' + this.value.substring(end);
+        this.selectionStart = this.selectionEnd = start + 1;
+        return;
+    }
+});
+
+// Ctrl+L to clear output
+document.addEventListener('keydown', function(e) {
+    if (e.ctrlKey && e.key === 'l') {
+        e.preventDefault();
+        clearOutput();
+    }
+});
+
+// ---- Initialize ----
+fetchServerInfo();
+fetchLogs();
+setInterval(fetchServerInfo, 30000);
+</script>
+
+</body>
+</html>
