@@ -448,7 +448,7 @@ namespace iris {
 			});
 
 			return true;
-		});
+		}, 0);
 	}
 
 	void ngx_lua_cpp_t::reset_main_warp() {
