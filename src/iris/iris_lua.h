@@ -57,14 +57,6 @@ extern "C" {
 #define LUA_NUMTYPES (LUA_TTHREAD + 1)
 #endif
 
-#if LUA_VERSION_NUM <= 502
-#define LUA_ENABLE_YIELDK 0
-#define LUA_CLEAR_STACK_ON_YIELD 1
-#else
-#define LUA_ENABLE_YIELDK 1
-#define LUA_CLEAR_STACK_ON_YIELD 0
-#endif
-
 #if LUA_VERSION_NUM <= 503
 #define lua_newuserdatauv(L, size, uv) lua_newuserdata(L, size)
 #endif
@@ -192,14 +184,19 @@ namespace iris {
 			lua_pop(L, 1);
 		}
 
+		static void raw_getregistry(lua_State* L, const char* name) {
+			lua_pushstring(L, name);
+			lua_rawget(L, LUA_REGISTRYINDEX);
+		}
+
 		// systrap is a low level error-capturing machanism
 		// usually you can get errors from result_error_t when calling lua
 		// but in LuaJIT and Lua 5.1, it is impossible to retrieve errors from C-lua mixed coroutines
-		// so you could declare a __iris_systrap__ lua variable to make a workaround.
+		// so you could store a __iris_systrap__ function in REGISTRY to make a workaround.
 		template <typename... args_t>
 		static void systrap(lua_State* L, const char* category, const char* format, args_t&&... args) {
 			stack_guard_t stack_guard(L);
-			raw_getglobal(L, "__iris_systrap__");
+			raw_getregistry(L, "__iris_systrap__");
 
 			if (lua_type(L, -1) == LUA_TFUNCTION) {
 				lua_pushstring(L, category);
@@ -278,8 +275,8 @@ namespace iris {
 			optional_result_t() : base_t(value_t()) {}
 			optional_result_t(result_error_t&& err) : message(std::move(err.message)) {}
 			optional_result_t(const result_error_t& err) : message(err.message) {}
-			optional_result_t(const std::conditional_t<!std::is_void_v<return_t>, return_t, nullptr_t>& value) : base_t(value) {}
-			optional_result_t(std::conditional_t<!std::is_void_v<return_t>, return_t, nullptr_t>&& value) : base_t(std::move(value)) {}
+			optional_result_t(const std::conditional_t<!std::is_void_v<return_t>, return_t, std::nullptr_t>& value) : base_t(value) {}
+			optional_result_t(std::conditional_t<!std::is_void_v<return_t>, return_t, std::nullptr_t>&& value) : base_t(std::move(value)) {}
 
 			std::string message;
 		};
@@ -750,7 +747,7 @@ namespace iris {
 
 		template <typename type_t, typename... args_t>
 		static auto make_shared(args_t&&... args) {
-			return shared_ref_t<type_t>::template make(std::forward<args_t>(args)...);
+			return shared_ref_t<type_t>::make(std::forward<args_t>(args)...);
 		}
 
 		// trivial trait behavior: pushing & getting variable by value
@@ -860,7 +857,7 @@ namespace iris {
 				subtype_t* object = *p;
 				if (object->view_count++ == 0) {
 					iris_lua_traits_t<type_t>::type::lua_shared_acquire(iris_lua_traits_t<type_t>::type::lua_view_extract(lua, index, p));
-					object->ref = lua.get_context<iris_lua_t::ref_t>(iris_lua_t::context_stackvalue_t(index));
+					object->ref = lua.native_get_variable<iris_lua_t::ref_t>(index);
 				}
 			}
 
@@ -1360,61 +1357,16 @@ namespace iris {
 			return ref_t(luaL_ref(L, LUA_REGISTRYINDEX));
 		}
 
-		// context pesudo keys
-		struct context_this_t {};
-		struct context_table_t {};
-		struct context_upvalue_t {
-			context_upvalue_t(int i) noexcept : index(i) {}
+		struct stackindex_t {
+			stackindex_t(int i) noexcept : index(i) {}
 			int index;
 		};
-
-		struct context_stackvalue_t {
-			context_stackvalue_t(int i) noexcept : index(i) {}
-			int index;
-		};
-
-		struct context_stack_top_t {};
-		struct context_stack_where_t {
-			context_stack_where_t(int lv) noexcept : level(lv) {}
-			int level;
-		};
-
 		struct registry_type_hash_t {
 			registry_type_hash_t(const void* h) noexcept : hash(h) {}
 			operator bool() const noexcept { return true; }
 
 			const void* hash;
 		};
-
-		// get from context
-		template <typename value_t, typename key_t>
-		value_t get_context(key_t&& key) {
-			auto guard = write_fence();
-			lua_State* L = state;
-			stack_guard_t stack_guard(L);
-
-			using type_t = remove_cvref_t<key_t>;
-			if constexpr (std::is_same_v<type_t, context_this_t>) {
-				IRIS_ASSERT(lua_isuserdata(L, 1));
-				return get_variable<value_t>(L, 1);
-			} else if constexpr (std::is_same_v<type_t, context_table_t>) {
-				IRIS_ASSERT(lua_istable(L, -1));
-				return get_variable<value_t>(L, -1);
-			} else if constexpr (std::is_same_v<type_t, context_upvalue_t>) {
-				return get_variable<value_t>(L, lua_upvalueindex(key.index));
-			} else if constexpr (std::is_same_v<type_t, context_stackvalue_t>) {
-				return get_variable<value_t>(L, key.index);
-			} else if constexpr (std::is_same_v<type_t, context_stack_top_t>) {
-				return lua_gettop(L);
-			} else if constexpr (std::is_same_v<type_t, context_stack_where_t>) {
-				luaL_where(L, key.level);
-				value_t ret = get_variable<value_t>(L, -1);
-				lua_pop(L, 1);
-				return std::move(ret);
-			} else {
-				return value_t();
-			}
-		}
 
 		// get from lua registry table
 		template <typename value_t, typename key_t>
@@ -2058,7 +2010,7 @@ namespace iris {
 		}
 
 		template <typename return_t, typename encoder_t, typename stream_t>
-		static ref_t encode_internal_entry(iris_lua_t lua, context_stackvalue_t stack, std::reference_wrapper<const encoder_t> encoder, std::reference_wrapper<stream_t> bytes_wrapper) {
+		static ref_t encode_internal_entry(iris_lua_t lua, stackindex_t stack, std::reference_wrapper<const encoder_t> encoder, std::reference_wrapper<stream_t> bytes_wrapper) {
 			stream_t& bytes = bytes_wrapper;
 			lua_State* L = lua.get_state();
 			lua_newtable(L);
@@ -2787,8 +2739,8 @@ namespace iris {
 				return iris_lua_traits_t<value_t>::type::lua_fromstack(iris_lua_t(L), index);
 			} else if constexpr (std::is_null_pointer_v<value_t>) {
 				return nullptr;
-			} else if constexpr (std::is_same_v<type_t, context_stackvalue_t>) {
-				return context_stackvalue_t(lua_absindex(L, index));
+			} else if constexpr (std::is_same_v<type_t, stackindex_t>) {
+				return stackindex_t(lua_absindex(L, index));
 			} else if constexpr (iris_is_reference_wrapper<type_t>::value) {
 				// pass reference wrapper as plain pointer without lifetime management, usually used by new_object() internally
 				return std::ref(*reinterpret_cast<typename type_t::type*>(lua_touserdata(L, index)));
@@ -3023,7 +2975,7 @@ namespace iris {
 				}
 			} else if constexpr (std::is_null_pointer_v<value_t>) {
 				// do not check
-			} else if constexpr (std::is_same_v<type_t, context_stackvalue_t>) {
+			} else if constexpr (std::is_same_v<type_t, stackindex_t>) {
 				// do not check
 			} else if constexpr (iris_is_reference_wrapper<type_t>::value) {
 				check_result = lua_islightuserdata(L, var_index);
@@ -3215,14 +3167,8 @@ namespace iris {
 							push_variable(L, std::move(value));
 						}
 
-#if LUA_CLEAR_STACK_ON_YIELD
-						int count = lua_gettop(L); // old lua will clear input parameters as coroutine yield
-#else
-						int count = lua_gettop(L) - top;
-#endif
-						IRIS_ASSERT(count >= 0);
 						push_variable(L, context);
-						coroutine_continuation(L, count, address);
+						coroutine_continuation(L, address);
 					}).run();
 				} else {
 					coroutine.complete([=](void* address) {
@@ -3237,7 +3183,7 @@ namespace iris {
 						
 						lua_pushnil(L);
 						push_variable(L, address);
-						coroutine_continuation(L, 1, address);
+						coroutine_continuation(L, address);
 					}).run();
 				}
 
@@ -3264,8 +3210,9 @@ namespace iris {
 			lua_rawset(L, LUA_REGISTRYINDEX);
 		}
 
-		static void coroutine_continuation(lua_State* L, int count, void* address) {
+		static void coroutine_continuation(lua_State* L, void* address) {
 			if (lua_status(L) == LUA_YIELD) {
+				int count = 1;
 				bool ret_error = lua_touserdata(L, -1) == reinterpret_cast<char*>(L) + 1;
 				if (!ret_error) {
 					lua_pop(L, 1);
@@ -3351,7 +3298,7 @@ namespace iris {
 #else
 					// however if you use a lower version (including LuaJIT),
 					// since C-continuation from yielding point is not possible, we cannot resume the coroutine anymore as C-error happends,
-					// try using __iris_systrap__ to capture it
+					// try using __iris_systrap__ from REGISTRY to capture it
 					return IRIS_LUA_YIELD(L, 0);
 #endif
 				}
