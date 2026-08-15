@@ -125,6 +125,30 @@ prefix (`web/run`), so no path editing is needed. `web/run-server.ps1` copies it
 prefix in sync with the canonical files. The web UI has five tabs: a Lua console, the
 Mandelbrot renderer, the concurrent fetcher, the job queue and a log viewer.
 
+### Run it on Linux
+
+```bash
+# 1. build (set LUA_DIR to your OpenResty LuaJIT if it isn't auto-detected)
+LUA_DIR=/usr/local/openresty/luajit cmake -S . -B build
+cmake --build build -j
+
+# 2. one-command helper (uses `openresty`, falls back to `nginx`; override with NGINX_BIN=...)
+./web/run-server.sh            # start
+./web/run-server.sh restart    # stop, sync, start
+./web/run-server.sh stop       # stop
+./web/run-server.sh build      # cmake configure + build
+
+# 3. open the demo center
+xdg-open http://localhost:8080
+```
+
+The same `web/nginx.conf` works on both platforms: the Lua init block appends the
+Windows (`build/Debug/?.dll`) and Linux (`build/lib?.so`) library paths to
+`package.cpath`, so `require` picks whichever exists. The shell helper is careful
+about process management: it matches the nginx master by its command line
+(`-p <prefix>`) so it never touches an unrelated system nginx, survives stale pid
+files (graceful stop -> force-kill fallback), and cleans the pid file afterwards.
+
 ### Demo 1: Mandelbrot parallel renderer
 
 `inst:mandelbrot(width, height, iterations, cx, cy, zoom, mode)` returns
