@@ -27,6 +27,13 @@ SOFTWARE.
 
 #pragma once
 
+#include <string>
+#include <tuple>
+#include <vector>
+#include <map>
+#include <memory>
+#include <mutex>
+
 #ifdef NGX_LUA_CPP_EXPORT
 	#ifdef __GNUC__
 		#define NGX_LUA_CPP_API __attribute__ ((visibility ("default")))
@@ -91,6 +98,29 @@ namespace iris {
 		size_t get_hardware_concurrency() const noexcept;
 		// example async demo: sleep
 		iris_coroutine_t<size_t> sleep(size_t milliseconds);
+
+		// demo 1: parallel mandelbrot renderer.
+		// mode == 0 -> parallel (one row-task per row, pre-dispatched to the worker pool),
+		// mode != 0 -> serial (all rows rendered on a single worker thread).
+		// returns (bmp_bytes, render_elapsed_ms). bmp is a 24bpp uncompressed BMP.
+		using mandelbrot_result_t = std::tuple<std::string, double>;
+		iris_coroutine_t<mandelbrot_result_t> mandelbrot(size_t width, size_t height, size_t iterations, double cx, double cy, double zoom, size_t mode);
+
+		// demo 2: concurrent http fetch (fan-out / fan-in).
+		// each url is fetched by a blocking WinHTTP request running on the worker pool.
+		// returns (entries, total_elapsed_ms); entry = (url, ok, status, bytes, elapsed_ms, info)
+		// where info is the first 256 bytes of the body when ok, or the error message.
+		using fetch_entry_t = std::tuple<std::string, bool, size_t, size_t, double, std::string>;
+		using fetch_result_t = std::tuple<std::vector<fetch_entry_t>, double>;
+		iris_coroutine_t<fetch_result_t> fetch(std::vector<std::string> urls, size_t timeout_ms);
+
+		// demo 3: in-memory job queue shared by all requests.
+		// job kinds: "count_primes" (payload: limit), "sleep_steps" (payload: steps, ms).
+		// jobs run in background coroutines that hop pool <-> warp to report progress.
+		std::string job_submit(const std::string& kind, const std::map<std::string, double>& payload);
+		std::tuple<std::string, double, double, std::string> job_query(const std::string& id); // (status, progress, elapsed_ms, result)
+		std::vector<std::tuple<std::string, std::string, std::string, double, double>> job_list(); // (id, kind, status, progress, elapsed_ms)
+
 		std::shared_ptr<iris_async_worker_t<>> get_async_worker() noexcept { return async_worker; }
 		
 		// inspect internal
@@ -104,6 +134,23 @@ namespace iris {
 		friend struct ngx_hooker_t;
 
 	protected:
+		struct ngx_job_t {
+			std::string id;
+			std::string kind;
+			std::map<std::string, double> payload;
+			std::string status;   // queued / running / done / failed
+			std::string result;
+			double progress = 0.0; // 0..1
+			double elapsed_ms = 0.0;
+			double created_ms = 0.0;
+		};
+
+		iris_coroutine_t<void> run_job(std::shared_ptr<ngx_job_t> job);
+
+		std::mutex jobs_mutex;
+		std::map<std::string, std::shared_ptr<ngx_job_t>> jobs;
+		size_t job_counter = 0;
+
 		std::shared_ptr<iris_async_worker_t<>> async_worker;
 		std::unique_ptr<ngx_warp_t> main_warp;
 		std::unique_ptr<ngx_warp_t::preempt_guard_t> main_warp_guard;

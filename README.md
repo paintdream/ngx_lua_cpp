@@ -54,7 +54,6 @@ For http, configure at **http/server** block:
 			ngx.say("ngx_lua_cpp http demo! Running " .. tostring(inst:is_running()) .. " | " .. tostring(value))
 		}
 	}
-}
 ```
 
 For stream, configure at **stream** block)
@@ -96,3 +95,72 @@ coroutine_t<size_t> ngx_lua_cpp_t::sleep(size_t millseconds) {
 ```
 
 You can use coroutines and the warp (strand) system from the iris library, which are fully compatible with OpenResty/Nginx's task scheduler.
+
+## Demo Center
+
+The repository ships a **demo center** (`web/`) that showcases what this project is good at:
+server-side logic written as plain C++20 coroutines, with blocking work automatically
+offloaded to a worker pool while the nginx worker stays responsive.
+
+### Run it
+
+```bat
+:: 1. build the library (x86 to match a 32-bit OpenResty, e.g. WinNMP's nginx.exe)
+cmake -S . -B build -A Win32
+cmake --build build --config Debug
+
+:: 2. start OpenResty with the web/ prefix (paths resolve relative to it)
+nginx.exe -p C:/Code/ngx_lua_cpp/web/run -c conf/nginx.conf
+
+:: 3. open the demo center
+start http://localhost:8080
+```
+
+`web/nginx.conf` resolves the Lua sources and the built library relative to the nginx
+prefix (`web/run`), so no path editing is needed. Copy it to `web/run/conf/nginx.conf`
+(or run `-c` with an absolute path). The web UI has five tabs: a Lua console, the
+Mandelbrot renderer, the concurrent fetcher, the job queue and a log viewer.
+
+### Demo 1: Mandelbrot parallel renderer
+
+`inst:mandelbrot(width, height, iterations, cx, cy, zoom, mode)` returns
+`(bmp_bytes, elapsed_ms)` where `bmp_bytes` is a 24bpp BMP.
+
+* `mode = 0` (parallel): one row-task per row is **pre-dispatched** to the worker pool
+  (`iris_awaitable_parallel` + `dispatch()`), then the coroutine **fan-ins** by awaiting
+  them in order. On a 4-thread pool this typically yields **3.5x-4x speedup** over serial.
+* `mode = 1` (serial): all rows rendered on a single worker thread (the comparison baseline).
+
+The render itself is plain synchronous C++ code — no callbacks, no partitioning
+bookkeeping: the coroutine just looks like a normal blocking function.
+
+### Demo 2: concurrent HTTP fetch (fan-out / fan-in)
+
+`inst:fetch(urls_table, timeout_ms)` returns `(entries, total_elapsed_ms)`; each entry is
+`(url, ok, status, bytes, elapsed_ms, info)`. Every URL is fetched by a **blocking
+WinHTTP request running on the worker pool**, all in parallel. Fetching N URLs takes
+about as long as the slowest one. `info` holds the first 256 bytes of the body (or the
+error message).
+
+### Demo 3: in-memory job queue
+
+`inst:job_submit(kind, payload)` / `inst:job_query(id)` / `inst:job_list()` share one C++
+state map across all requests. Jobs run as background coroutines that **hop between the
+worker pool and the nginx warp**: each chunk is computed on the pool, then
+`co_await iris_switch(main_warp)` publishes progress on the nginx thread, then
+`co_await iris_switch(nullptr)` returns to the pool. Kinds:
+
+* `count_primes` — segmented sieve up to `payload.limit` (default 10,000,000).
+* `sleep_steps` — sleeps `payload.ms` in `payload.steps` steps (a deterministic
+  progress ticker).
+
+### Why these demos
+
+| Capability | Where it shows |
+|---|---|
+| C++20 coroutines as "normal blocking code" | `mandelbrot`/`fetch` bodies read top-to-bottom, no callbacks |
+| Blocking work offloaded, worker never blocked | `/api/info` answers in ms while a heavy render runs |
+| Parallel fan-out + fan-in | row tasks / URL tasks pre-dispatched, joined by `co_await` |
+| Coroutine return values flow back into Lua | `co_return` of tuples/vectors/maps become Lua tables |
+| Cross-request shared C++ state | the job queue lives in the C++ instance, shared by all workers/requests |
+| warp-based scheduling | job progress hops pool &rarr; warp &rarr; pool via `iris_switch` |

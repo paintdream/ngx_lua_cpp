@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ngx_lua_cpp Debug Console</title>
+<title>ngx_lua_cpp Demo Center</title>
 <style>
 :root {
     --bg-primary: #1e1e2e;
@@ -18,6 +18,7 @@
     --green: #a6e3a1;
     --red: #f38ba8;
     --yellow: #f9e2af;
+    --orange: #fab387;
     --border: #45475a;
     --scrollbar: #585b70;
 }
@@ -82,11 +83,55 @@ body {
     background: var(--red);
 }
 
-/* Main layout */
-.main {
+/* Tab bar */
+.tab-bar {
     display: flex;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    padding: 0 12px;
+    flex-shrink: 0;
+}
+
+.tab-btn {
+    padding: 9px 16px;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-secondary);
+    font-size: 13px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.tab-btn:hover {
+    color: var(--text-primary);
+}
+
+.tab-btn.active {
+    color: var(--text-primary);
+    border-bottom-color: var(--accent);
+    font-weight: 600;
+}
+
+/* Main */
+.main {
     flex: 1;
     overflow: hidden;
+    position: relative;
+}
+
+.tab-page {
+    display: none;
+    height: 100%;
+    overflow: hidden;
+}
+
+.tab-page.active {
+    display: flex;
+    flex-direction: column;
 }
 
 /* Panels */
@@ -94,17 +139,8 @@ body {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-}
-
-.panel-left {
     flex: 1;
-    border-right: 1px solid var(--border);
-    min-width: 0;
-}
-
-.panel-right {
-    flex: 1;
-    min-width: 0;
+    min-height: 0;
 }
 
 .panel-header {
@@ -149,6 +185,11 @@ body {
     background: var(--bg-hover);
 }
 
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 .btn-primary {
     background: var(--accent);
     color: var(--bg-primary);
@@ -169,12 +210,248 @@ body {
     background: rgba(243, 139, 168, 0.15);
 }
 
-/* Code editor */
+/* Form controls */
+.demo-controls {
+    padding: 10px 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+.control-group {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.control-group label {
+    white-space: nowrap;
+}
+
+.control-group input[type="number"],
+.control-group input[type="text"],
+.control-group select,
+.demo-controls input[type="number"],
+.demo-controls select,
+.log-controls select,
+.log-controls input[type="number"],
+.log-controls input[type="text"] {
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    font-size: 12px;
+    outline: none;
+    max-width: 110px;
+}
+
+.demo-controls input[type="number"] {
+    width: 84px;
+}
+
+.demo-controls .wide {
+    max-width: 220px;
+    width: 200px;
+}
+
+.control-group input[type="number"] {
+    width: 74px;
+}
+
+.preset-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 6px 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+.preset-row .hint {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+/* Content areas */
+.demo-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 0;
+}
+
+.card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    flex-shrink: 0;
+}
+
+.card h3 {
+    font-size: 13px;
+    margin-bottom: 8px;
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.render-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.render-box {
+    flex: 1;
+    min-width: 300px;
+    text-align: center;
+}
+
+.render-box img {
+    max-width: 100%;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: #000;
+    image-rendering: pixelated;
+}
+
+.render-box .caption {
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.render-box .caption b {
+    color: var(--text-primary);
+}
+
+.speedup-banner {
+    font-size: 14px;
+    padding: 10px 14px;
+    border-radius: 6px;
+    background: rgba(166, 227, 161, 0.1);
+    border: 1px solid rgba(166, 227, 161, 0.3);
+    color: var(--green);
+    display: none;
+}
+
+.speedup-banner b {
+    font-size: 18px;
+}
+
+.mono {
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+}
+
+/* Result table */
+.result-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.result-table th, .result-table td {
+    text-align: left;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+}
+
+.result-table th {
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+}
+
+.result-table td {
+    word-break: break-all;
+}
+
+.tag {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.tag-ok {
+    background: rgba(166, 227, 161, 0.15);
+    color: var(--green);
+}
+
+.tag-fail {
+    background: rgba(243, 139, 168, 0.15);
+    color: var(--red);
+}
+
+.tag-queued {
+    background: rgba(166, 173, 200, 0.15);
+    color: var(--text-secondary);
+}
+
+.tag-running {
+    background: rgba(137, 180, 250, 0.15);
+    color: var(--accent);
+}
+
+.tag-done {
+    background: rgba(166, 227, 161, 0.15);
+    color: var(--green);
+}
+
+.tag-failed {
+    background: rgba(243, 139, 168, 0.15);
+    color: var(--red);
+}
+
+.progress-wrap {
+    width: 140px;
+    height: 8px;
+    background: var(--bg-surface);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.progress-bar {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 4px;
+    transition: width 0.2s;
+}
+
+.summary-line {
+    font-size: 12px;
+    color: var(--text-secondary);
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+
+.summary-line b {
+    color: var(--text-primary);
+}
+
+/* Lua terminal */
 .editor-container {
     flex: 1;
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    min-height: 0;
 }
 
 .code-editor {
@@ -196,7 +473,6 @@ body {
     color: var(--text-muted);
 }
 
-/* Output */
 .output-container {
     border-top: 1px solid var(--border);
     max-height: 40%;
@@ -292,21 +568,6 @@ body {
     color: var(--text-secondary);
 }
 
-.log-controls select,
-.log-controls input[type="number"] {
-    padding: 3px 6px;
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    font-size: 12px;
-    outline: none;
-}
-
-.log-controls input[type="number"] {
-    width: 60px;
-}
-
 .log-controls .auto-refresh {
     display: flex;
     align-items: center;
@@ -349,6 +610,16 @@ body {
     color: var(--text-primary);
 }
 
+/* Shortcut hint */
+.shortcut-hint {
+    font-size: 11px;
+    color: var(--text-muted);
+    padding: 4px 12px;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
     width: 8px;
@@ -368,26 +639,18 @@ body {
     background: var(--text-muted);
 }
 
-/* Keyboard shortcut hint */
-.shortcut-hint {
-    font-size: 11px;
-    color: var(--text-muted);
-    padding: 4px 12px;
-    background: var(--bg-secondary);
-    border-top: 1px solid var(--border);
-    flex-shrink: 0;
+.spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
 }
 
-/* Responsive */
-@media (max-width: 768px) {
-    .main {
-        flex-direction: column;
-    }
-
-    .panel-left {
-        border-right: none;
-        border-bottom: 1px solid var(--border);
-    }
+@keyframes spin {
+    to { transform: rotate(360deg); }
 }
 </style>
 </head>
@@ -397,7 +660,7 @@ body {
 <div class="header">
     <div class="header-title">
         <span class="logo">&#9881;</span>
-        <span>ngx_lua_cpp Debug Console</span>
+        <span>ngx_lua_cpp Demo Center</span>
     </div>
     <div class="header-info">
         <span id="server-status"><span class="status-dot offline"></span>Connecting...</span>
@@ -405,68 +668,478 @@ body {
     </div>
 </div>
 
+<!-- Tabs -->
+<div class="tab-bar">
+    <button class="tab-btn active" data-tab="console" onclick="switchTab('console')">&#9654; Lua 控制台</button>
+    <button class="tab-btn" data-tab="mandelbrot" onclick="switchTab('mandelbrot')">&#127756; Mandelbrot 并行渲染</button>
+    <button class="tab-btn" data-tab="fetch" onclick="switchTab('fetch')">&#128230; 并发抓取</button>
+    <button class="tab-btn" data-tab="jobs" onclick="switchTab('jobs')">&#9203; 任务队列</button>
+    <button class="tab-btn" data-tab="logs" onclick="switchTab('logs')">&#128220; 日志</button>
+</div>
+
 <!-- Main -->
 <div class="main">
-    <!-- Left panel: Lua Terminal -->
-    <div class="panel panel-left">
-        <div class="panel-header">
-            <h2>&#9654; Lua Terminal</h2>
-            <div class="panel-actions">
-                <button class="btn" onclick="clearEditor()" title="Clear editor">Clear</button>
-                <button class="btn btn-primary" onclick="executeCode()" title="Run code (Ctrl+Enter)">&#9654; Run</button>
+
+    <!-- ============ Tab: Lua Console ============ -->
+    <div id="page-console" class="tab-page active">
+        <div class="panel">
+            <div class="panel-header">
+                <h2>&#9654; Lua Terminal <span style="color: var(--text-muted); font-weight: 400;">(call ngx_lua_cpp methods directly)</span></h2>
+                <div class="panel-actions">
+                    <button class="btn" onclick="clearEditor()" title="Clear editor">Clear</button>
+                    <button class="btn btn-primary" onclick="executeCode()" title="Run code (Ctrl+Enter)">&#9654; Run</button>
+                </div>
             </div>
-        </div>
-        <div class="editor-container">
-            <textarea id="code-editor" class="code-editor" placeholder="-- Enter Lua code here...&#10;-- Press Ctrl+Enter to execute&#10;-- Examples:&#10;--   print('Hello from ngx_lua_cpp!')&#10;--   print(ngx.config.nginx_version)&#10;--   local inst = require('init_ngx_lua_cpp')&#10;--   print('Running: ' .. tostring(inst:is_running()))" spellcheck="false"></textarea>
-        </div>
-        <div class="shortcut-hint">
-            Ctrl+Enter to run &middot; Ctrl+L to clear output &middot; Tab to indent
-        </div>
-        <div class="output-container">
-            <div class="output-header">
-                <h3>Output</h3>
-                <button class="btn" onclick="clearOutput()" title="Clear output (Ctrl+L)" style="padding: 2px 6px; font-size: 11px;">Clear</button>
+            <div class="editor-container">
+                <textarea id="code-editor" class="code-editor" spellcheck="false">-- ngx_lua_cpp demos, callable right from Lua:
+local inst = require("init_ngx_lua_cpp")
+
+-- 1) async sleep (non-blocking: nginx worker stays responsive)
+-- print("sleep ->", inst:sleep(40))
+
+-- 2) parallel mandelbrot: returns {bmp_base64_like_string, elapsed_ms}
+-- local r = inst:mandelbrot(320, 240, 200, -0.5, 0, 1, 0)  -- mode 0 = parallel
+-- print("mandelbrot bmp bytes:", #r[1], "elapsed_ms:", r[2])
+
+-- 3) concurrent fetch: returns {entries, total_ms}
+-- local r = inst:fetch({"http://127.0.0.1:8080/lua.html", "http://127.0.0.1:8080/api/info"}, 5000)
+-- print("fetch entries:", #r[1], "total_ms:", r[2])
+
+-- 4) job queue: submit, then poll
+-- local id = inst:job_submit("count_primes", {limit = 10000000})
+-- print("job id:", id)
+-- local q = inst:job_query(id)
+-- print("status:", q[1], "progress:", q[2], "result:", q[4])
+
+print("ngx_lua_cpp running:", inst:is_running())</textarea>
             </div>
-            <div id="output-content" class="output-content">
-                <span style="color: var(--text-muted);">Output will appear here...</span>
+            <div class="shortcut-hint">
+                Ctrl+Enter to run &middot; Ctrl+L to clear output &middot; Tab to indent
+            </div>
+            <div class="output-container">
+                <div class="output-header">
+                    <h3>Output</h3>
+                    <button class="btn" onclick="clearOutput()" title="Clear output (Ctrl+L)" style="padding: 2px 6px; font-size: 11px;">Clear</button>
+                </div>
+                <div id="output-content" class="output-content">
+                    <span style="color: var(--text-muted);">Output will appear here...</span>
+                </div>
             </div>
         </div>
     </div>
 
-    <!-- Right panel: Log Viewer -->
-    <div class="panel panel-right">
-        <div class="panel-header">
-            <h2>&#128220; Server Logs</h2>
-            <div class="panel-actions">
-                <button class="btn btn-danger" onclick="clearLogs()" title="Clear log file">Clear Logs</button>
-                <button class="btn" onclick="fetchLogs()" title="Refresh logs">&#8635; Refresh</button>
+    <!-- ============ Tab: Mandelbrot ============ -->
+    <div id="page-mandelbrot" class="tab-page">
+        <div class="panel">
+            <div class="demo-controls">
+                <div class="control-group"><label>宽</label><input type="number" id="mb-w" value="480" min="32" max="1600"></div>
+                <div class="control-group"><label>高</label><input type="number" id="mb-h" value="360" min="32" max="1200"></div>
+                <div class="control-group"><label>迭代</label><input type="number" id="mb-iter" value="300" min="4" max="100000"></div>
+                <div class="control-group"><label>cx</label><input type="text" id="mb-cx" value="-0.5" class="wide"></div>
+                <div class="control-group"><label>cy</label><input type="text" id="mb-cy" value="0" class="wide"></div>
+                <div class="control-group"><label>zoom</label><input type="text" id="mb-zoom" value="1" class="wide"></div>
+                <button class="btn btn-primary" id="mb-render-btn" onclick="renderMandelbrot()">&#127756; 渲染并对比 (并行 vs 串行)</button>
+                <button class="btn" id="mb-stress-btn" onclick="renderWithPing()">&#9889; 渲染 + 并发响应测试</button>
+            </div>
+            <div class="preset-row">
+                <span class="hint">预设视点:</span>
+                <button class="btn" onclick="setView(-0.5, 0, 1, 300)">全貌</button>
+                <button class="btn" onclick="setView(-0.7453, 0.1127, 250, 800)">海马谷</button>
+                <button class="btn" onclick="setView(0.285, 0.01, 250, 800)">大象谷</button>
+                <button class="btn" onclick="setView(-0.7269, 0.1889, 1500, 1200)">旋涡深处</button>
+                <button class="btn" onclick="setView(-0.743643887037151, 0.13182590420533, 8000, 2000)">深放大 &times;8000</button>
+                <span class="hint" style="margin-left:auto;">渲染在 C++ 线程池上按行并行执行，nginx worker 不被阻塞</span>
+            </div>
+            <div class="demo-content">
+                <div class="speedup-banner" id="mb-speedup"></div>
+                <div class="render-row">
+                    <div class="render-box">
+                        <img id="mb-img-par" alt="parallel render" style="display:none;">
+                        <div class="caption" id="mb-cap-par">并行模式 (mode=0)：每行一个任务预分发到线程池</div>
+                    </div>
+                    <div class="render-box">
+                        <img id="mb-img-ser" alt="serial render" style="display:none;">
+                        <div class="caption" id="mb-cap-ser">串行模式 (mode=1)：单线程逐行渲染</div>
+                    </div>
+                </div>
+                <div class="card" id="mb-ping-card" style="display:none;">
+                    <h3>并发响应测试</h3>
+                    <div class="summary-line" id="mb-ping-line"></div>
+                </div>
             </div>
         </div>
-        <div class="log-controls">
-            <label for="log-type">Type:</label>
-            <select id="log-type" onchange="fetchLogs()">
-                <option value="error">Error Log</option>
-                <option value="access">Access Log</option>
-            </select>
-            <label for="log-lines">Lines:</label>
-            <input type="number" id="log-lines" value="200" min="10" max="10000" onchange="fetchLogs()">
-            <div class="auto-refresh">
-                <input type="checkbox" id="auto-refresh" onchange="toggleAutoRefresh()">
-                <label for="auto-refresh">Auto-refresh (5s)</label>
+    </div>
+
+    <!-- ============ Tab: Fetch ============ -->
+    <div id="page-fetch" class="tab-page">
+        <div class="panel">
+            <div class="demo-controls">
+                <div class="control-group"><label>超时(ms)</label><input type="number" id="ft-timeout" value="5000" min="100" max="30000"></div>
+                <button class="btn btn-primary" id="ft-btn" onclick="runFetch()">&#128230; 并发抓取</button>
+            </div>
+            <div class="preset-row">
+                <span class="hint">预设:</span>
+                <button class="btn" onclick="setUrls('local3')">本地 3 个端点</button>
+                <button class="btn" onclick="setUrls('local6')">本地 6 个端点 (含 404/坏 URL)</button>
+                <span class="hint" style="margin-left:auto;">每个 URL 一个阻塞 WinHTTP 请求，跑在线程池上并行执行</span>
+            </div>
+            <div class="demo-content">
+                <div class="card">
+                    <h3>URL 列表（每行一个）</h3>
+                    <textarea id="ft-urls" class="code-editor" rows="8" spellcheck="false" style="min-height:130px;">http://127.0.0.1:8080/lua.html
+http://127.0.0.1:8080/api/info
+http://127.0.0.1:8080/</textarea>
+                </div>
+                <div class="summary-line" id="ft-summary" style="display:none;"></div>
+                <div class="card" id="ft-results-card" style="display:none;">
+                    <h3>结果</h3>
+                    <table class="result-table">
+                        <thead><tr><th>#</th><th>URL</th><th>状态</th><th>HTTP</th><th>字节</th><th>耗时(ms)</th><th>响应头/信息</th></tr></thead>
+                        <tbody id="ft-results"></tbody>
+                    </table>
+                </div>
             </div>
         </div>
-        <div class="log-container">
-            <div id="log-content" class="log-content">Loading logs...</div>
+    </div>
+
+    <!-- ============ Tab: Jobs ============ -->
+    <div id="page-jobs" class="tab-page">
+        <div class="panel">
+            <div class="demo-controls">
+                <div class="control-group">
+                    <label>任务类型</label>
+                    <select id="jb-kind" onchange="onJobKindChange()">
+                        <option value="count_primes">count_primes（素数计数）</option>
+                        <option value="sleep_steps">sleep_steps（分步睡眠）</option>
+                    </select>
+                </div>
+                <div class="control-group" id="jb-payload-primes"><label>limit</label><input type="number" id="jb-limit" value="50000000" min="1000" max="200000000"></div>
+                <div class="control-group" id="jb-payload-sleep" style="display:none;"><label>steps</label><input type="number" id="jb-steps" value="40" min="1" max="200"><label>ms</label><input type="number" id="jb-ms" value="4000" min="100" max="60000"></div>
+                <button class="btn btn-primary" onclick="submitJob()">&#10133; 提交任务</button>
+            </div>
+            <div class="preset-row">
+                <span class="hint">任务在后台协程中运行：每个分块完成后 协程跳回 nginx warp 更新进度，再跳回线程池继续 —— 全程不占用 nginx worker。</span>
+            </div>
+            <div class="demo-content">
+                <div class="card">
+                    <h3>任务列表 <span style="color:var(--text-muted);font-weight:400;">(自动刷新)</span></h3>
+                    <table class="result-table">
+                        <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>进度</th><th>耗时(ms)</th><th>结果</th></tr></thead>
+                        <tbody id="jb-list"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Tab: Logs ============ -->
+    <div id="page-logs" class="tab-page">
+        <div class="panel">
+            <div class="panel-header">
+                <h2>&#128220; Server Logs</h2>
+                <div class="panel-actions">
+                    <button class="btn btn-danger" onclick="clearLogs()" title="Clear log file">Clear Logs</button>
+                    <button class="btn" onclick="fetchLogs()" title="Refresh logs">&#8635; Refresh</button>
+                </div>
+            </div>
+            <div class="log-controls">
+                <label for="log-type">Type:</label>
+                <select id="log-type" onchange="fetchLogs()">
+                    <option value="error">Error Log</option>
+                    <option value="access">Access Log</option>
+                </select>
+                <label for="log-lines">Lines:</label>
+                <input type="number" id="log-lines" value="200" min="10" max="10000" onchange="fetchLogs()">
+                <div class="auto-refresh">
+                    <input type="checkbox" id="auto-refresh" onchange="toggleAutoRefresh()">
+                    <label for="auto-refresh">Auto-refresh (5s)</label>
+                </div>
+            </div>
+            <div class="log-container">
+                <div id="log-content" class="log-content">Loading logs...</div>
+            </div>
         </div>
     </div>
 </div>
 
 <script>
+// ---- Tab switching ----
+function switchTab(name) {
+    document.querySelectorAll('.tab-btn').forEach(function(b) {
+        b.classList.toggle('active', b.dataset.tab === name);
+    });
+    document.querySelectorAll('.tab-page').forEach(function(p) {
+        p.classList.toggle('active', p.id === 'page-' + name);
+    });
+    if (name === 'jobs') refreshJobs();
+    if (name === 'logs') fetchLogs();
+}
+
 // ---- State ----
 let autoRefreshTimer = null;
 let outputEntries = [];
+let jobsTimer = null;
 
-// ---- Code Execution ----
+// ============================================================
+// Mandelbrot
+// ============================================================
+function setView(cx, cy, zoom, iter) {
+    document.getElementById('mb-cx').value = cx;
+    document.getElementById('mb-cy').value = cy;
+    document.getElementById('mb-zoom').value = zoom;
+    document.getElementById('mb-iter').value = iter;
+}
+
+function readMandelbrotParams() {
+    return {
+        w: parseInt(document.getElementById('mb-w').value) || 480,
+        h: parseInt(document.getElementById('mb-h').value) || 360,
+        iter: parseInt(document.getElementById('mb-iter').value) || 300,
+        cx: parseFloat(document.getElementById('mb-cx').value) || -0.5,
+        cy: parseFloat(document.getElementById('mb-cy').value) || 0,
+        zoom: parseFloat(document.getElementById('mb-zoom').value) || 1
+    };
+}
+
+function mbQueryString(p, mode) {
+    return '/api/mandelbrot?w=' + p.w + '&h=' + p.h + '&iter=' + p.iter +
+        '&cx=' + p.cx + '&cy=' + p.cy + '&zoom=' + p.zoom + '&mode=' + mode;
+}
+
+async function mbFetch(mode) {
+    const resp = await fetch(mbQueryString(readMandelbrotParams(), mode));
+    return resp.json();
+}
+
+async function renderMandelbrot() {
+    const btn = document.getElementById('mb-render-btn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> 渲染中...';
+    document.getElementById('mb-speedup').style.display = 'none';
+
+    try {
+        const [par, ser] = await Promise.all([mbFetch(0), mbFetch(1)]);
+        const parImg = document.getElementById('mb-img-par');
+        const serImg = document.getElementById('mb-img-ser');
+        if (par.ok) {
+            parImg.src = 'data:image/bmp;base64,' + par.bmp;
+            parImg.style.display = 'block';
+            document.getElementById('mb-cap-par').innerHTML =
+                '并行 (mode=0)：<b>' + par.elapsed_ms.toFixed(1) + ' ms</b>（' + par.w + '&times;' + par.h +
+                ' &times; ' + par.iter + ' iter，每行一个任务预分发到线程池）';
+        }
+        if (ser.ok) {
+            serImg.src = 'data:image/bmp;base64,' + ser.bmp;
+            serImg.style.display = 'block';
+            document.getElementById('mb-cap-ser').innerHTML =
+                '串行 (mode=1)：<b>' + ser.elapsed_ms.toFixed(1) + ' ms</b>（单线程逐行）';
+        }
+        if (par.ok && ser.ok && ser.elapsed_ms > 0) {
+            const speedup = ser.elapsed_ms / par.elapsed_ms;
+            const banner = document.getElementById('mb-speedup');
+            banner.style.display = 'block';
+            banner.innerHTML = '&#9889; 并行加速 <b>' + speedup.toFixed(2) + '&times;</b> —— 同样 4 线程池 (' +
+                '<span class="mono">inst:start(4)</span>)，行级任务并行 + 协程 fan-in 聚合';
+        }
+    } catch (err) {
+        alert('渲染失败: ' + err.message);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '&#127756; 渲染并对比 (并行 vs 串行)';
+    }
+}
+
+async function renderWithPing() {
+    const btn = document.getElementById('mb-stress-btn');
+    btn.disabled = true;
+
+    const p = readMandelbrotParams();
+    p.w = Math.min(p.w, 900);
+    p.h = Math.min(p.h, 600);
+    p.iter = Math.max(p.iter, 500);
+
+    const card = document.getElementById('mb-ping-card');
+    card.style.display = 'block';
+    document.getElementById('mb-ping-line').innerHTML =
+        '串行渲染 ' + p.w + '&times;' + p.h + ' &times; ' + p.iter + ' iter 的同时，发起一个 /api/info 请求...';
+
+    try {
+        // serial render (heavy) + a light request, launched together
+        const renderResp = fetch(mbQueryString(p, 1));
+        const t0 = performance.now();
+        const pingResp = await fetch('/api/info');
+        await pingResp.json();
+        const pingMs = (performance.now() - t0).toFixed(1);
+        const renderData = await (await renderResp).json();
+        const renderMs = renderData.elapsed_ms.toFixed(1);
+
+        document.getElementById('mb-ping-line').innerHTML =
+            '&#9989; 渲染耗时 <b>' + renderMs + ' ms</b>（在 C++ 线程池上），同时 /api/info 请求 <b>' + pingMs +
+            ' ms</b> 即返回 —— <span style="color:var(--green);">nginx worker 全程未被阻塞</span>。' +
+            '如果用纯同步方式写这个渲染，/api/info 至少要等渲染结束。';
+    } catch (err) {
+        document.getElementById('mb-ping-line').innerHTML = '测试失败: ' + escapeHtml(err.message);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+// ============================================================
+// Fetch
+// ============================================================
+function setUrls(preset) {
+    const box = document.getElementById('ft-urls');
+    if (preset === 'local3') {
+        box.value = 'http://127.0.0.1:8080/lua.html\nhttp://127.0.0.1:8080/api/info\nhttp://127.0.0.1:8080/';
+    } else {
+        box.value = 'http://127.0.0.1:8080/lua.html\nhttp://127.0.0.1:8080/api/info\nhttp://127.0.0.1:8080/\n' +
+            'http://127.0.0.1:8080/nonexistent\nftp://bad.example.com/x\nhttp://127.0.0.1:8080/api/fetch';
+    }
+}
+
+async function runFetch() {
+    const btn = document.getElementById('ft-btn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> 抓取中...';
+
+    const urls = document.getElementById('ft-urls').value.split('\n')
+        .map(function(s) { return s.trim(); })
+        .filter(function(s) { return s.length > 0; });
+
+    if (urls.length === 0) {
+        alert('请输入至少一个 URL');
+        btn.disabled = false;
+        btn.innerHTML = '&#128230; 并发抓取';
+        return;
+    }
+
+    try {
+        const resp = await fetch('/api/fetch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({urls: urls, timeout: parseInt(document.getElementById('ft-timeout').value) || 5000})
+        });
+        const data = await resp.json();
+        if (!data.ok) throw new Error(data.error || 'fetch failed');
+
+        const sum = data.results.reduce(function(a, e) { return a + (e.ok ? 1 : 0); }, 0);
+        document.getElementById('ft-summary').style.display = 'flex';
+        document.getElementById('ft-summary').innerHTML =
+            '<span>URL 数: <b>' + data.url_count + '</b></span>' +
+            '<span>成功: <b style="color:var(--green);">' + sum + '</b></span>' +
+            '<span>失败: <b style="color:var(--red);">' + (data.url_count - sum) + '</b></span>' +
+            '<span>C++ 总耗时: <b>' + data.total_ms.toFixed(1) + ' ms</b></span>' +
+            '<span>墙钟: <b>' + data.wall_ms + ' ms</b></span>' +
+            '<span style="color:var(--text-muted);">并行抓取 N 个 URL 的总时间 &asymp; 最慢那一个</span>';
+
+        const tbody = document.getElementById('ft-results');
+        tbody.innerHTML = data.results.map(function(e, i) {
+            return '<tr>' +
+                '<td>' + (i + 1) + '</td>' +
+                '<td class="mono">' + escapeHtml(e.url) + '</td>' +
+                '<td><span class="tag ' + (e.ok ? 'tag-ok' : 'tag-fail') + '">' + (e.ok ? 'OK' : 'FAIL') + '</span></td>' +
+                '<td>' + (e.status || '-') + '</td>' +
+                '<td>' + e.bytes + '</td>' +
+                '<td>' + e.elapsed_ms.toFixed(1) + '</td>' +
+                '<td class="mono" style="font-size:11px;color:var(--text-secondary);max-width:380px;">' +
+                    escapeHtml((e.info || '').substring(0, 220)) + (e.info && e.info.length > 220 ? '...' : '') + '</td>' +
+                '</tr>';
+        }).join('');
+        document.getElementById('ft-results-card').style.display = 'block';
+    } catch (err) {
+        alert('抓取失败: ' + err.message);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '&#128230; 并发抓取';
+    }
+}
+
+// ============================================================
+// Jobs
+// ============================================================
+function onJobKindChange() {
+    const kind = document.getElementById('jb-kind').value;
+    document.getElementById('jb-payload-primes').style.display = kind === 'count_primes' ? 'flex' : 'none';
+    document.getElementById('jb-payload-sleep').style.display = kind === 'sleep_steps' ? 'flex' : 'none';
+}
+
+async function submitJob() {
+    const kind = document.getElementById('jb-kind').value;
+    const payload = {};
+    if (kind === 'count_primes') {
+        payload.limit = parseInt(document.getElementById('jb-limit').value) || 50000000;
+    } else {
+        payload.steps = parseInt(document.getElementById('jb-steps').value) || 40;
+        payload.ms = parseInt(document.getElementById('jb-ms').value) || 4000;
+    }
+
+    try {
+        const resp = await fetch('/api/jobs/submit', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({kind: kind, payload: payload})
+        });
+        const data = await resp.json();
+        if (!data.ok) throw new Error(data.error || 'submit failed');
+        refreshJobs();
+        startJobsTimer();
+    } catch (err) {
+        alert('提交失败: ' + err.message);
+    }
+}
+
+async function refreshJobs() {
+    try {
+        const resp = await fetch('/api/jobs/list');
+        const data = await resp.json();
+        if (!data.ok) return;
+
+        const tbody = document.getElementById('jb-list');
+        if (data.jobs.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);">暂无任务</td></tr>';
+            stopJobsTimer();
+            return;
+        }
+
+        let anyRunning = false;
+        tbody.innerHTML = data.jobs.slice().reverse().map(function(j) {
+            if (j.status === 'running' || j.status === 'queued') anyRunning = true;
+            const pct = Math.round((j.progress || 0) * 100);
+            return '<tr>' +
+                '<td class="mono">' + escapeHtml(j.id) + '</td>' +
+                '<td class="mono">' + escapeHtml(j.kind) + '</td>' +
+                '<td><span class="tag tag-' + j.status + '">' + escapeHtml(j.status) + '</span></td>' +
+                '<td><div class="progress-wrap"><div class="progress-bar" style="width:' + pct + '%"></div></div> ' + pct + '%</td>' +
+                '<td>' + (j.elapsed_ms ? j.elapsed_ms.toFixed(0) : '-') + '</td>' +
+                '<td class="mono" style="font-size:11px;color:var(--text-secondary);">' + escapeHtml(j.result || '') + '</td>' +
+                '</tr>';
+        }).join('');
+
+        if (anyRunning) {
+            startJobsTimer();
+        } else {
+            stopJobsTimer();
+        }
+    } catch (err) {
+        // server unreachable; keep the timer going
+    }
+}
+
+function startJobsTimer() {
+    if (jobsTimer) return;
+    jobsTimer = setInterval(refreshJobs, 700);
+}
+
+function stopJobsTimer() {
+    if (jobsTimer) {
+        clearInterval(jobsTimer);
+        jobsTimer = null;
+    }
+}
+
+// ============================================================
+// Lua console (unchanged behavior)
+// ============================================================
 async function executeCode() {
     const editor = document.getElementById('code-editor');
     const code = editor.value.trim();
@@ -538,7 +1211,9 @@ function clearEditor() {
     document.getElementById('code-editor').focus();
 }
 
-// ---- Log Viewer ----
+// ============================================================
+// Log viewer
+// ============================================================
 async function fetchLogs() {
     const logType = document.getElementById('log-type').value;
     const lines = document.getElementById('log-lines').value;
@@ -607,7 +1282,9 @@ function getLogLevelClass(line) {
     return '';
 }
 
-// ---- Server Info ----
+// ============================================================
+// Server info
+// ============================================================
 async function fetchServerInfo() {
     try {
         const resp = await fetch('/api/info');
@@ -629,23 +1306,25 @@ async function fetchServerInfo() {
     }
 }
 
-// ---- Utilities ----
+// ============================================================
+// Utilities
+// ============================================================
 function escapeHtml(text) {
     const div = document.createElement('div');
-    div.appendChild(document.createTextNode(text));
+    div.appendChild(document.createTextNode(String(text)));
     return div.innerHTML;
 }
 
-// ---- Keyboard Shortcuts ----
+// ============================================================
+// Keyboard shortcuts
+// ============================================================
 document.getElementById('code-editor').addEventListener('keydown', function(e) {
-    // Ctrl+Enter to execute
     if (e.ctrlKey && e.key === 'Enter') {
         e.preventDefault();
         executeCode();
         return;
     }
 
-    // Tab to indent
     if (e.key === 'Tab') {
         e.preventDefault();
         const start = this.selectionStart;
@@ -656,7 +1335,6 @@ document.getElementById('code-editor').addEventListener('keydown', function(e) {
     }
 });
 
-// Ctrl+L to clear output
 document.addEventListener('keydown', function(e) {
     if (e.ctrlKey && e.key === 'l') {
         e.preventDefault();
@@ -664,7 +1342,9 @@ document.addEventListener('keydown', function(e) {
     }
 });
 
-// ---- Initialize ----
+// ============================================================
+// Initialize
+// ============================================================
 fetchServerInfo();
 fetchLogs();
 setInterval(fetchServerInfo, 30000);

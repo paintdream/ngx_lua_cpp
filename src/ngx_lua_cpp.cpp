@@ -32,9 +32,16 @@ SOFTWARE.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winhttp.h>
 #else
 #include <dlfcn.h>
 #endif
+
+#include <algorithm>
+#include <cmath>
+#include <chrono>
+#include <functional>
+#include <thread>
 
 namespace iris {
 	int ngx_iris_wrap_coroutine_with_returns_key;
@@ -525,6 +532,453 @@ namespace iris {
 		co_return std::move(millseconds);
 	}
 
+	// ---------------------------------------------------------------------------
+	// demo 1: parallel mandelbrot renderer
+	// ---------------------------------------------------------------------------
+
+	namespace {
+		struct palette_stop_t {
+			double t;
+			uint8_t r, g, b;
+		};
+
+		const palette_stop_t mandelbrot_palette[] = {
+			{ 0.00, 0, 7, 100 },
+			{ 0.16, 32, 107, 203 },
+			{ 0.42, 237, 255, 255 },
+			{ 0.64, 255, 170, 0 },
+			{ 0.86, 0, 2, 0 },
+		};
+
+		void palette_color(double t, uint8_t& r, uint8_t& g, uint8_t& b) {
+			const palette_stop_t* last = mandelbrot_palette + (sizeof(mandelbrot_palette) / sizeof(mandelbrot_palette[0])) - 1;
+			if (t <= 0.0) { r = mandelbrot_palette[0].r; g = mandelbrot_palette[0].g; b = mandelbrot_palette[0].b; return; }
+			if (t >= 1.0) { r = last->r; g = last->g; b = last->b; return; }
+			for (const palette_stop_t* p = mandelbrot_palette + 1; p <= last; p++) {
+				if (t <= p->t) {
+					const palette_stop_t& a = *(p - 1);
+					double k = (t - a.t) / (p->t - a.t);
+					r = (uint8_t)(a.r + (p->r - a.r) * k);
+					g = (uint8_t)(a.g + (p->g - a.g) * k);
+					b = (uint8_t)(a.b + (p->b - a.b) * k);
+					return;
+				}
+			}
+			r = last->r; g = last->g; b = last->b;
+		}
+
+		// render one row (top-down) into out (width * 3 bytes, BGR order as BMP expects)
+		void render_mandelbrot_row(uint8_t* out, size_t y, size_t width, size_t height, size_t iterations, double re_min, double im_max, double pixel_size) {
+			const double ci = im_max - y * pixel_size;
+			for (size_t x = 0; x < width; x++) {
+				const double cr = re_min + x * pixel_size;
+				double zr = 0.0, zi = 0.0, zr2 = 0.0, zi2 = 0.0;
+				size_t n = 0;
+				while (n < iterations) {
+					if (zr2 + zi2 > 4.0) break;
+					zi = 2.0 * zr * zi + ci;
+					zr = zr2 - zi2 + cr;
+					zr2 = zr * zr;
+					zi2 = zi * zi;
+					n++;
+				}
+
+				if (n == iterations) {
+					out[x * 3] = 0; out[x * 3 + 1] = 0; out[x * 3 + 2] = 0;
+				} else {
+					// smooth escape-time: mu = n + 1 - log2(log(|z|))
+					double mu = (double)n + 1.0 - std::log2(std::log(zr2 + zi2) * 0.5);
+					double t = std::clamp(mu / (double)iterations, 0.0, 1.0);
+					uint8_t r, g, b;
+					palette_color(t, r, g, b);
+					out[x * 3] = b; out[x * 3 + 1] = g; out[x * 3 + 2] = r;
+				}
+			}
+		}
+
+		std::string encode_bmp(size_t width, size_t height, const uint8_t* rgb_topdown) {
+			const size_t row_size = (width * 3 + 3) & ~(size_t)3;
+			const size_t data_size = row_size * height;
+			std::string bmp(54 + data_size, '\0');
+			uint8_t* p = reinterpret_cast<uint8_t*>(bmp.data());
+			p[0] = 'B'; p[1] = 'M';
+			uint32_t v32 = (uint32_t)bmp.size(); std::memcpy(p + 2, &v32, 4);
+			v32 = 0; std::memcpy(p + 6, &v32, 4);
+			v32 = 54; std::memcpy(p + 10, &v32, 4);
+			v32 = 40; std::memcpy(p + 14, &v32, 4);
+			int32_t v32s = (int32_t)width; std::memcpy(p + 18, &v32s, 4);
+			v32s = (int32_t)height; std::memcpy(p + 22, &v32s, 4);
+			uint16_t v16 = 1; std::memcpy(p + 26, &v16, 2);
+			v16 = 24; std::memcpy(p + 28, &v16, 2);
+			v32 = 0; std::memcpy(p + 30, &v32, 4);
+			v32 = (uint32_t)data_size; std::memcpy(p + 34, &v32, 4);
+			// pixels are stored bottom-up
+			for (size_t y = 0; y < height; y++) {
+				std::memcpy(p + 54 + y * row_size, rgb_topdown + (height - 1 - y) * width * 3, width * 3);
+			}
+			return bmp;
+		}
+	}
+
+	iris_coroutine_t<ngx_lua_cpp_t::mandelbrot_result_t> ngx_lua_cpp_t::mandelbrot(size_t width, size_t height, size_t iterations, double cx, double cy, double zoom, size_t mode) {
+		width = std::clamp(width, size_t(16), size_t(1600));
+		height = std::clamp(height, size_t(16), size_t(1200));
+		iterations = std::clamp(iterations, size_t(4), size_t(100000));
+
+		// hop to the worker pool; every Lua-called coroutine starts on the nginx thread.
+		ngx_warp_t* main = co_await iris_switch<ngx_warp_t>(nullptr);
+
+		const double span = 3.0 / std::max(zoom, 1e-6);
+		const double re_min = cx - span * 0.5;
+		const double im_max = cy + span * 0.5;
+		const double pixel_size = span / (double)width;
+
+		std::vector<uint8_t> pixels(width * height * 3);
+		const auto t0 = std::chrono::steady_clock::now();
+
+		if (mode == 0 && height > 1) {
+			// parallel: pre-dispatch one row-task per row to the worker pool,
+			// then fan-in by awaiting them in order.
+			using row_task_t = iris_awaitable_t<ngx_warp_t, std::function<void()>>;
+			std::vector<std::unique_ptr<row_task_t>> tasks;
+			tasks.reserve(height);
+			for (size_t y = 0; y < height; y++) {
+				uint8_t* row = pixels.data() + y * width * 3;
+				tasks.push_back(std::make_unique<row_task_t>(main, std::function<void()>([row, y, width, height, iterations, re_min, im_max, pixel_size]() {
+					render_mandelbrot_row(row, y, width, height, iterations, re_min, im_max, pixel_size);
+				}), 1));
+				tasks.back()->dispatch();
+			}
+			for (auto& task : tasks) {
+				co_await *task;
+			}
+		} else {
+			// serial: render everything on this (pool) thread
+			for (size_t y = 0; y < height; y++) {
+				render_mandelbrot_row(pixels.data() + y * width * 3, y, width, height, iterations, re_min, im_max, pixel_size);
+			}
+		}
+
+		const double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		std::string bmp = encode_bmp(width, height, pixels.data());
+
+		// hop back to the nginx warp so the completion handler can safely push
+		// the return values onto the Lua stack.
+		co_await iris_switch(main);
+		co_return std::make_tuple(std::move(bmp), elapsed_ms);
+	}
+
+	// ---------------------------------------------------------------------------
+	// demo 2: concurrent http fetch (fan-out / fan-in)
+	// ---------------------------------------------------------------------------
+
+	namespace {
+		struct http_url_t {
+			std::string host;
+			std::string path = "/";
+			size_t port = 80;
+			bool ok = false;
+			std::string error;
+		};
+
+		http_url_t parse_http_url(const std::string& url) {
+			http_url_t result;
+			if (url.rfind("http://", 0) != 0) {
+				result.error = "only http:// URLs are supported";
+				return result;
+			}
+
+			std::string rest = url.substr(7);
+			size_t slash = rest.find('/');
+			std::string authority = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+			std::string path = (slash == std::string::npos) ? "/" : rest.substr(slash);
+
+			size_t colon = authority.rfind(':');
+			if (colon != std::string::npos) {
+				result.port = (size_t)std::atol(authority.substr(colon + 1).c_str());
+				result.host = authority.substr(0, colon);
+			} else {
+				result.host = authority;
+			}
+
+			if (result.host.empty() || result.port == 0) {
+				result.error = "invalid url: " + url;
+				return result;
+			}
+			if (path.empty()) path = "/";
+			result.path = std::move(path);
+			result.ok = true;
+			return result;
+		}
+
+#ifdef _WIN32
+		ngx_lua_cpp_t::fetch_entry_t http_get(const http_url_t& url, size_t timeout_ms, size_t max_bytes) {
+			ngx_lua_cpp_t::fetch_entry_t entry;
+			std::get<0>(entry) = "http://" + url.host + (url.port == 80 ? "" : ":" + std::to_string(url.port)) + url.path;
+			const auto t0 = std::chrono::steady_clock::now();
+
+			HINTERNET hSession = ::WinHttpOpen(L"ngx_lua_cpp-demo/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+			if (hSession == nullptr) {
+				std::get<5>(entry) = "WinHttpOpen failed";
+				return entry;
+			}
+
+			::WinHttpSetTimeouts(hSession, (int)timeout_ms, (int)timeout_ms, (int)timeout_ms, (int)timeout_ms);
+
+			const std::wstring whost(url.host.begin(), url.host.end());
+			const std::wstring wpath(url.path.begin(), url.path.end());
+
+			HINTERNET hConnect = ::WinHttpConnect(hSession, whost.c_str(), (INTERNET_PORT)url.port, 0);
+			if (hConnect == nullptr) {
+				::WinHttpCloseHandle(hSession);
+				std::get<5>(entry) = "WinHttpConnect failed";
+				return entry;
+			}
+
+			HINTERNET hRequest = ::WinHttpOpenRequest(hConnect, L"GET", wpath.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+			if (hRequest == nullptr) {
+				::WinHttpCloseHandle(hConnect);
+				::WinHttpCloseHandle(hSession);
+				std::get<5>(entry) = "WinHttpOpenRequest failed";
+				return entry;
+			}
+
+			bool ok = ::WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) != FALSE;
+			if (ok) {
+				ok = ::WinHttpReceiveResponse(hRequest, nullptr) != FALSE;
+			}
+
+			if (!ok) {
+				std::get<5>(entry) = "WinHttpSendRequest/ReceiveResponse failed";
+			} else {
+				DWORD status = 0;
+				DWORD status_len = sizeof(status);
+				if (::WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_len, WINHTTP_NO_HEADER_INDEX)) {
+					std::get<2>(entry) = (size_t)status;
+				}
+
+				std::string body;
+				DWORD available = 0;
+				while (::WinHttpQueryDataAvailable(hRequest, &available) && available > 0) {
+					DWORD want = (DWORD)std::min<size_t>(available, max_bytes - body.size());
+					if (want == 0) break;
+					std::string chunk(want, '\0');
+					DWORD read = 0;
+					if (!::WinHttpReadData(hRequest, chunk.data(), want, &read) || read == 0) break;
+					body.append(chunk.data(), read);
+					if (body.size() >= max_bytes) break;
+				}
+
+				std::get<3>(entry) = body.size();
+				std::get<1>(entry) = true;
+				std::get<5>(entry) = body.substr(0, 256);
+			}
+
+			::WinHttpCloseHandle(hRequest);
+			::WinHttpCloseHandle(hConnect);
+			::WinHttpCloseHandle(hSession);
+
+			std::get<4>(entry) = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+			return entry;
+		}
+#else
+		ngx_lua_cpp_t::fetch_entry_t http_get(const http_url_t& url, size_t timeout_ms, size_t max_bytes) {
+			ngx_lua_cpp_t::fetch_entry_t entry;
+			std::get<0>(entry) = "http://" + url.host + (url.port == 80 ? "" : ":" + std::to_string(url.port)) + url.path;
+			std::get<5>(entry) = "not supported on this platform";
+			return entry;
+		}
+#endif
+	}
+
+	iris_coroutine_t<ngx_lua_cpp_t::fetch_result_t> ngx_lua_cpp_t::fetch(std::vector<std::string> urls, size_t timeout_ms) {
+		ngx_lua_cpp_t::fetch_result_t result;
+		std::vector<fetch_entry_t>& entries = std::get<0>(result);
+		entries.resize(urls.size());
+
+		if (urls.empty()) {
+			co_return std::move(result);
+		}
+
+		timeout_ms = std::clamp(timeout_ms, size_t(100), size_t(30000));
+
+		ngx_warp_t* main = co_await iris_switch<ngx_warp_t>(nullptr);
+		const auto t0 = std::chrono::steady_clock::now();
+
+		// fan-out: one blocking WinHTTP request per url, each on the worker pool.
+		using fetch_task_t = iris_awaitable_t<ngx_warp_t, std::function<fetch_entry_t()>>;
+		std::vector<std::unique_ptr<fetch_task_t>> tasks;
+		std::vector<size_t> task_indices;
+		tasks.reserve(urls.size());
+		for (size_t i = 0; i < urls.size(); i++) {
+			http_url_t url = parse_http_url(urls[i]);
+			if (!url.ok) {
+				// parse error: fill the entry directly, no pool task needed
+				std::get<0>(entries[i]) = urls[i];
+				std::get<5>(entries[i]) = url.error;
+				continue;
+			}
+			tasks.push_back(std::make_unique<fetch_task_t>(main, std::function<fetch_entry_t()>([url, timeout_ms]() {
+				return http_get(url, timeout_ms, 1024 * 1024);
+			}), 1));
+			tasks.back()->dispatch();
+			task_indices.push_back(i);
+		}
+
+		// fan-in
+		for (size_t k = 0; k < task_indices.size(); k++) {
+			entries[task_indices[k]] = co_await *tasks[k];
+		}
+
+		std::get<1>(result) = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+		co_await iris_switch(main);
+		co_return std::move(result);
+	}
+
+	// ---------------------------------------------------------------------------
+	// demo 3: in-memory job queue
+	// ---------------------------------------------------------------------------
+
+	std::string ngx_lua_cpp_t::job_submit(const std::string& kind, const std::map<std::string, double>& payload) {
+		if (!is_running()) {
+			return "";
+		}
+
+		auto job = std::make_shared<ngx_job_t>();
+		{
+			std::lock_guard<std::mutex> guard(jobs_mutex);
+			job_counter++;
+			char id_buf[32];
+			std::snprintf(id_buf, sizeof(id_buf), "J%05zu", job_counter);
+			job->id = id_buf;
+			job->kind = kind;
+			job->payload = payload;
+			job->status = "queued";
+			job->created_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+			jobs[job->id] = job;
+
+			// keep the list bounded; ids are monotonic so the oldest jobs are first
+			while (jobs.size() > 200) {
+				jobs.erase(jobs.begin());
+			}
+		}
+
+		// fire and forget: the runner hops to the worker pool and never touches Lua again
+		iris_coroutine_t<void> runner = run_job(job);
+		runner.run();
+		return job->id;
+	}
+
+	std::tuple<std::string, double, double, std::string> ngx_lua_cpp_t::job_query(const std::string& id) {
+		std::lock_guard<std::mutex> guard(jobs_mutex);
+		auto it = jobs.find(id);
+		if (it == jobs.end()) {
+			return std::make_tuple(std::string("not_found"), 0.0, 0.0, std::string());
+		}
+		const std::shared_ptr<ngx_job_t>& job = it->second;
+		return std::make_tuple(job->status, job->progress, job->elapsed_ms, job->result);
+	}
+
+	std::vector<std::tuple<std::string, std::string, std::string, double, double>> ngx_lua_cpp_t::job_list() {
+		std::vector<std::tuple<std::string, std::string, std::string, double, double>> result;
+		std::lock_guard<std::mutex> guard(jobs_mutex);
+		result.reserve(jobs.size());
+		for (auto& [id, job] : jobs) {
+			result.emplace_back(id, job->kind, job->status, job->progress, job->elapsed_ms);
+		}
+		return result;
+	}
+
+	iris_coroutine_t<void> ngx_lua_cpp_t::run_job(std::shared_ptr<ngx_job_t> job) {
+		ngx_warp_t* main = co_await iris_switch<ngx_warp_t>(nullptr);
+		const auto t0 = std::chrono::steady_clock::now();
+
+		{
+			std::lock_guard<std::mutex> guard(jobs_mutex);
+			job->status = "running";
+		}
+
+		std::string result_text;
+		bool failed = false;
+
+		if (job->kind == "count_primes") {
+			size_t limit = (size_t)(job->payload.count("limit") ? job->payload.at("limit") : 10000000.0);
+			limit = std::clamp<size_t>(limit, 1000, 200000000);
+
+			// base primes up to sqrt(limit)
+			const size_t root = (size_t)std::sqrt((double)limit) + 1;
+			std::vector<uint8_t> base(root + 1, 1);
+			base[0] = base[1] = 0;
+			for (size_t i = 2; i * i <= root; i++) {
+				if (base[i]) {
+					for (size_t k = i * i; k <= root; k += i) base[k] = 0;
+				}
+			}
+			std::vector<size_t> primes;
+			for (size_t i = 2; i <= root; i++) {
+				if (base[i]) primes.push_back(i);
+			}
+
+			// segmented sieve, reported chunk by chunk through the warp
+			const size_t chunks = 40;
+			const size_t seg_size = std::max<size_t>(limit / chunks, 1);
+			size_t count = 0;
+			for (size_t c = 0; c < chunks; c++) {
+				size_t lo = std::max(c * seg_size, size_t(2));
+				size_t hi = std::min(lo + seg_size, limit);
+				if (lo >= hi) break;
+
+				std::vector<uint8_t> mark(hi - lo, 1);
+				for (size_t p : primes) {
+					size_t start = std::max(p * p, ((lo + p - 1) / p) * p);
+					for (size_t k = start; k < hi; k += p) mark[k - lo] = 0;
+				}
+				for (uint8_t m : mark) count += m;
+
+				// hop to the nginx warp to publish progress, then back to the pool
+				co_await iris_switch(main);
+				{
+					std::lock_guard<std::mutex> guard(jobs_mutex);
+					job->progress = (double)(c + 1) / (double)chunks;
+				}
+				co_await iris_switch<ngx_warp_t>(nullptr);
+			}
+
+			result_text = std::to_string(count) + " primes <= " + std::to_string(limit);
+		} else if (job->kind == "sleep_steps") {
+			size_t steps = (size_t)(job->payload.count("steps") ? job->payload.at("steps") : 50.0);
+			double ms = job->payload.count("ms") ? job->payload.at("ms") : 2000.0;
+			steps = std::clamp<size_t>(steps, 1, 200);
+			ms = std::clamp(ms, 100.0, 60000.0);
+			const size_t step_ms = std::max<size_t>((size_t)(ms / (double)steps), 1);
+
+			for (size_t s = 0; s < steps; s++) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+				co_await iris_switch(main);
+				{
+					std::lock_guard<std::mutex> guard(jobs_mutex);
+					job->progress = (double)(s + 1) / (double)steps;
+				}
+				co_await iris_switch<ngx_warp_t>(nullptr);
+			}
+
+			result_text = "slept " + std::to_string(steps * step_ms) + " ms in " + std::to_string(steps) + " steps";
+		} else {
+			failed = true;
+			result_text = "unknown job kind: " + job->kind;
+		}
+
+		co_await iris_switch(main);
+		{
+			std::lock_guard<std::mutex> guard(jobs_mutex);
+			job->status = failed ? "failed" : "done";
+			job->result = result_text;
+			job->elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		}
+		co_return;
+	}
+
 	size_t ngx_lua_cpp_t::get_hardware_concurrency() const noexcept {
 		return std::thread::hardware_concurrency();
 	}
@@ -538,6 +992,13 @@ namespace iris {
 		lua.set_current<&ngx_lua_cpp_t::is_running>("is_running");
 		lua.set_current<&ngx_lua_cpp_t::get_hardware_concurrency>("get_hardware_concurrency");
 		lua.set_current<&ngx_lua_cpp_t::sleep>("sleep");
+
+		// demos
+		lua.set_current<&ngx_lua_cpp_t::mandelbrot>("mandelbrot");
+		lua.set_current<&ngx_lua_cpp_t::fetch>("fetch");
+		lua.set_current<&ngx_lua_cpp_t::job_submit>("job_submit");
+		lua.set_current<&ngx_lua_cpp_t::job_query>("job_query");
+		lua.set_current<&ngx_lua_cpp_t::job_list>("job_list");
 
 		lua.set_current<&ngx_lua_cpp_t::__async_worker__>("__async_worker__");
 	}

@@ -110,3 +110,8 @@ IF (MSVC)
 ELSE (MSVC)
 	TARGET_LINK_LIBRARIES (${NGX_LUA_CPP_LIBNAME} m dl stdc++ pthread ${LUA_CORE_LIB})
 ENDIF (MSVC)
+
+IF (WIN32)
+	# demo 2 (fetch) uses blocking WinHTTP calls on the worker pool
+	TARGET_LINK_LIBRARIES (${NGX_LUA_CPP_LIBNAME} winhttp)
+ENDIF (WIN32)
