@@ -22,23 +22,28 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# keep native stderr as plain stderr (best-effort `nginx -s stop` with a stale
+# pid file writes to stderr; with PS 7.3+ this would otherwise become a
+# terminating error and abort the script)
+$PSNativeCommandUseErrorActionPreference = $false
 $repo = Split-Path -Parent $MyInvocation.MyCommand.Path   # this script's dir = web/
 $run  = Join-Path $repo "run"
 $pidFile = Join-Path $run "logs/nginx.pid"
-
-function Invoke-Nginx([string[]]$NginxArgs) {
-    & $NginxExe @NginxArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "nginx exited with code $LASTEXITCODE"
-    }
-}
 
 # ---------------------------------------------------------------- stop
 if ($Stop -or $Restart) {
     if (Get-Process -Name "nginx" -ErrorAction SilentlyContinue) {
         Write-Host "Stopping nginx..."
+        # a stale pid file (crash / manual kill / test artifact) makes -s stop
+        # fail; never abort on that, fall through to the force-kill below.
+        # (PS 5.1 turns native stderr into terminating errors under
+        # $ErrorActionPreference=Stop, hence the try/catch.)
         if (Test-Path $pidFile) {
-            Invoke-Nginx @("-p", $run, "-c", "conf/nginx.conf", "-s", "stop")
+            try {
+                & $NginxExe -p $run -c conf/nginx.conf -s stop 2>$null
+            } catch {
+                # stale pid file - force-kill below
+            }
             # graceful shutdown can take a few seconds (keepalive timeouts)
             $deadline = (Get-Date).AddSeconds(10)
             while ((Get-Date) -lt $deadline) {
@@ -53,6 +58,7 @@ if ($Stop -or $Restart) {
             Write-Host "nginx stopped."
         }
     }
+    Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
     if ($Stop) { return }
 }
 
@@ -72,10 +78,14 @@ if (-not (Test-Path $mime)) {
 }
 
 # ---------------------------------------------------------------- start
-Write-Host "Starting nginx (prefix: $run)..."
-Start-Process -FilePath $NginxExe -ArgumentList "-p", $run, "-c", "conf/nginx.conf" `
-    -WorkingDirectory (Split-Path -Parent $NginxExe) -WindowStyle Hidden
-Start-Sleep -Seconds 1
+if (Get-Process -Name "nginx" -ErrorAction SilentlyContinue) {
+    Write-Host "nginx already running - use -Restart to restart it"
+} else {
+    Write-Host "Starting nginx (prefix: $run)..."
+    Start-Process -FilePath $NginxExe -ArgumentList "-p", $run, "-c", "conf/nginx.conf" `
+        -WorkingDirectory (Split-Path -Parent $NginxExe) -WindowStyle Hidden
+    Start-Sleep -Seconds 1
+}
 
 try {
     $info = Invoke-RestMethod -Uri "http://127.0.0.1:8080/api/info" -TimeoutSec 5
