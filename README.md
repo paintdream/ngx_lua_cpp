@@ -109,16 +109,20 @@ offloaded to a worker pool while the nginx worker stays responsive.
 cmake -S . -B build -A Win32
 cmake --build build --config Debug
 
-:: 2. start OpenResty with the web/ prefix (paths resolve relative to it)
-nginx.exe -p C:/Code/ngx_lua_cpp/web/run -c conf/nginx.conf
+:: 2. one-command helper: syncs config/UI into web/run, starts nginx, probes the server
+powershell -ExecutionPolicy Bypass -File web/run-server.ps1          :: start
+powershell -ExecutionPolicy Bypass -File web/run-server.ps1 -Restart :: stop, sync, start
+powershell -ExecutionPolicy Bypass -File web/run-server.ps1 -Stop    :: stop
 
 :: 3. open the demo center
 start http://localhost:8080
 ```
 
+Or manually: `nginx.exe -p C:/Code/ngx_lua_cpp/web/run -c conf/nginx.conf`.
 `web/nginx.conf` resolves the Lua sources and the built library relative to the nginx
-prefix (`web/run`), so no path editing is needed. Copy it to `web/run/conf/nginx.conf`
-(or run `-c` with an absolute path). The web UI has five tabs: a Lua console, the
+prefix (`web/run`), so no path editing is needed. `web/run-server.ps1` copies it (plus
+`web/index.html` and `mime.types`) into `web/run/` on every start, keeping the run
+prefix in sync with the canonical files. The web UI has five tabs: a Lua console, the
 Mandelbrot renderer, the concurrent fetcher, the job queue and a log viewer.
 
 ### Demo 1: Mandelbrot parallel renderer
