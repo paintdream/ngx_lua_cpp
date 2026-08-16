@@ -114,4 +114,6 @@ ENDIF (MSVC)
 IF (WIN32)
 	# demo 2 (fetch) uses blocking WinHTTP calls on the worker pool
 	TARGET_LINK_LIBRARIES (${NGX_LUA_CPP_LIBNAME} winhttp)
+	# demo 4 (udp_echo) uses Winsock2 datagram sockets on the worker pool
+	TARGET_LINK_LIBRARIES (${NGX_LUA_CPP_LIBNAME} ws2_32)
 ENDIF (WIN32)

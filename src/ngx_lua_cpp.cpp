@@ -32,16 +32,35 @@ SOFTWARE.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <winhttp.h>
 #else
 #include <dlfcn.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <functional>
+#include <list>
+#include <random>
 #include <thread>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 namespace iris {
 	int ngx_iris_wrap_coroutine_with_returns_key;
@@ -394,8 +413,7 @@ namespace iris {
 
 		ngx_int_t process_events(ngx_cycle_t* cycle, ngx_msec_t timer, ngx_uint_t flags) {
 			// dig out sleep placeholder events...
-			if (offset_http_co_ctx_event_queue != 0) {
-				for (auto* co_ctx : pending_lua_http_co_ctxs) {
+			if (offset_http_co_ctx_event_queue != 0) {				for (auto* co_ctx : pending_lua_http_co_ctxs) {
 					ngx_queue_t* p = reinterpret_cast<ngx_queue_t*>(reinterpret_cast<uintptr_t>(co_ctx) + offset_http_co_ctx_event_queue);
 					ngx_queue_remove(p);
 				}
@@ -412,7 +430,16 @@ namespace iris {
 
 			pending_stream_http_co_ctxs.clear();
 
+			// safety valve: under sustained warp traffic (e.g. datagram
+			// listeners polled by timers) `notified` can stay set while we
+			// drain, which would otherwise starve the nginx event loop; any
+			// remaining work is simply picked up on the next event pass.
+			int spins = 0;
 			do {
+				spins++;
+				if (spins > 1000) {
+					break;
+				}
 				for (ngx_lua_cpp_t* p : cpp_list) {
 					p->process_events();
 				}
@@ -445,7 +472,9 @@ namespace iris {
 		ngx_queue_t* ngx_posted_delayed_events = nullptr;
 	};
 
-	ngx_lua_cpp_t::ngx_lua_cpp_t() : async_worker(std::make_shared<iris_async_worker_t<>>()) {
+	ngx_lua_cpp_t::ngx_lua_cpp_t() : async_worker(std::make_shared<iris_async_worker_t<>>()),
+		event_bus(std::make_shared<event_bus_t>()),
+		lru_cache(std::make_shared<lru_cache_t>()) {
 		ngx_hooker_t::get_instance().insert(this);
 		reset_main_warp();
 
@@ -506,19 +535,6 @@ namespace iris {
 
 		stop_impl();
 		return {};
-	}
-
-	void ngx_lua_cpp_t::stop_impl() {
-		async_worker->terminate();
-		async_worker->join();
-
-		// manually polling events
-		while (main_warp->poll()) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(50));
-		}
-
-		main_thread_index = ~(size_t)0;
-		reset_main_warp();
 	}
 
 	bool ngx_lua_cpp_t::is_running() const noexcept {
@@ -837,6 +853,1085 @@ namespace iris {
 	}
 
 	// ---------------------------------------------------------------------------
+	// demo 4: UDP round-trip (datagram echo)
+	// ---------------------------------------------------------------------------
+
+	namespace {
+#ifdef _WIN32
+		using udp_socket_t = SOCKET;
+		constexpr udp_socket_t ngx_udp_invalid_socket = INVALID_SOCKET;
+#else
+		using udp_socket_t = int;
+		constexpr udp_socket_t ngx_udp_invalid_socket = -1;
+#endif
+
+		void udp_close_socket(udp_socket_t sock) {
+#ifdef _WIN32
+			::closesocket(sock);
+#else
+			::close(sock);
+#endif
+		}
+
+		void udp_set_receive_timeout(udp_socket_t sock, DWORD timeout_ms) {
+#ifdef _WIN32
+			::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+#else
+			struct timeval tv = { (time_t)(timeout_ms / 1000), (suseconds_t)((timeout_ms % 1000) * 1000) };
+			::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+		}
+
+		// resolve + send one datagram; returns (ok, err)
+		std::tuple<bool, std::string> udp_sendto_impl(const std::string& host, size_t port, const std::string& payload) {
+			if (host.empty() || port == 0 || port > 65535) {
+				return { false, "invalid host or port" };
+			}
+
+#ifdef _WIN32
+			WSADATA wsa;
+			if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+				return { false, "WSAStartup failed" };
+			}
+#endif
+
+			struct addrinfo hints = {};
+			hints.ai_family = AF_UNSPEC;
+			hints.ai_socktype = SOCK_DGRAM;
+			hints.ai_protocol = IPPROTO_UDP;
+
+			char port_buf[16];
+			std::snprintf(port_buf, sizeof(port_buf), "%zu", port);
+
+			struct addrinfo* addr_list = nullptr;
+			if (::getaddrinfo(host.c_str(), port_buf, &hints, &addr_list) != 0 || addr_list == nullptr) {
+#ifdef _WIN32
+				::WSACleanup();
+#endif
+				return { false, "getaddrinfo failed: " + host };
+			}
+
+			udp_socket_t sock = ::socket(addr_list->ai_family, addr_list->ai_socktype, addr_list->ai_protocol);
+			if (sock == ngx_udp_invalid_socket) {
+				::freeaddrinfo(addr_list);
+#ifdef _WIN32
+				::WSACleanup();
+#endif
+				return { false, "socket() failed" };
+			}
+
+			int sent = ::sendto(sock, payload.data(), (int)payload.size(), 0, addr_list->ai_addr, (int)addr_list->ai_addrlen);
+			udp_close_socket(sock);
+			::freeaddrinfo(addr_list);
+#ifdef _WIN32
+			::WSACleanup();
+#endif
+
+			if (sent < 0) {
+				return { false, "sendto failed" };
+			}
+			return { true, "" };
+		}
+
+		// open a file for reading; on Windows this uses CreateFileA with
+		// explicit share flags so files nginx itself keeps open (access log)
+		// are readable -- the MSVC CRT fopen can fail with EACCES on them.
+		FILE* ngx_file_open_read(const std::string& path) {
+#ifdef _WIN32
+			HANDLE h = ::CreateFileA(path.c_str(), GENERIC_READ,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (h == INVALID_HANDLE_VALUE) {
+				return nullptr;
+			}
+			int fd = _open_osfhandle((intptr_t)h, _O_RDONLY | _O_BINARY);
+			if (fd < 0) {
+				::CloseHandle(h);
+				return nullptr;
+			}
+			return _fdopen(fd, "rb");
+#else
+			return std::fopen(path.c_str(), "rb");
+#endif
+		}
+
+		// blocking datagram exchange; runs on the worker pool.
+		// one socket carries both send and receive so the reply arrives on
+		// the same ephemeral port we sent from.
+		ngx_lua_cpp_t::udp_result_t udp_roundtrip_impl(const std::string& host, size_t port, const std::string& payload, size_t timeout_ms) {
+			using namespace std::chrono;
+			ngx_lua_cpp_t::udp_result_t result;
+			const auto t0 = steady_clock::now();
+
+			if (host.empty() || port == 0 || port > 65535) {
+				std::get<3>(result) = "invalid host or port";
+				return result;
+			}
+
+#ifdef _WIN32
+			WSADATA wsa;
+			if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+				std::get<3>(result) = "WSAStartup failed";
+				return result;
+			}
+#endif
+
+			// resolve into a datagram socket address (IPv4 or IPv6)
+			struct addrinfo hints = {};
+			hints.ai_family = AF_UNSPEC;
+			hints.ai_socktype = SOCK_DGRAM;
+			hints.ai_protocol = IPPROTO_UDP;
+
+			char port_buf[16];
+			std::snprintf(port_buf, sizeof(port_buf), "%zu", port);
+
+			struct addrinfo* addr_list = nullptr;
+			if (::getaddrinfo(host.c_str(), port_buf, &hints, &addr_list) != 0 || addr_list == nullptr) {
+#ifdef _WIN32
+				::WSACleanup();
+#endif
+				std::get<3>(result) = "getaddrinfo failed: " + host;
+				return result;
+			}
+
+			udp_socket_t sock = ::socket(addr_list->ai_family, addr_list->ai_socktype, addr_list->ai_protocol);
+			if (sock == ngx_udp_invalid_socket) {
+				::freeaddrinfo(addr_list);
+#ifdef _WIN32
+				::WSACleanup();
+#endif
+				std::get<3>(result) = "socket() failed";
+				return result;
+			}
+
+			// receive timeout so a dead listener cannot hang the worker thread
+			udp_set_receive_timeout(sock, (DWORD)std::clamp(timeout_ms, size_t(50), size_t(30000)));
+
+			int sent = ::sendto(sock, payload.data(), (int)payload.size(), 0, addr_list->ai_addr, (int)addr_list->ai_addrlen);
+			if (sent < 0) {
+				udp_close_socket(sock);
+				::freeaddrinfo(addr_list);
+#ifdef _WIN32
+				::WSACleanup();
+#endif
+				std::get<3>(result) = "sendto failed";
+				return result;
+			}
+
+			char buf[65536];
+			int recvd = ::recvfrom(sock, buf, sizeof(buf), 0, nullptr, nullptr);
+			if (recvd < 0) {
+				std::get<3>(result) = "recvfrom failed or timed out";
+			} else {
+				std::get<0>(result) = true;
+				std::get<1>(result) = std::string(buf, (size_t)recvd);
+			}
+
+			udp_close_socket(sock);
+			::freeaddrinfo(addr_list);
+#ifdef _WIN32
+			::WSACleanup();
+#endif
+
+			std::get<2>(result) = duration<double, std::milli>(steady_clock::now() - t0).count();
+			return result;
+		}
+	}
+
+	// one background thread per listened port; it only receives datagrams
+	// into a bounded queue. Blocking recvfrom is woken every 500 ms by the
+	// socket receive timeout so the thread can observe stop().
+	struct ngx_lua_cpp_t::udp_listener_t {
+		size_t port = 0;
+		udp_socket_t sock = ngx_udp_invalid_socket;
+		std::atomic<bool> stop{ false };
+		std::thread thread;
+
+		std::mutex mutex;
+		std::condition_variable cv;
+		std::deque<std::tuple<std::string, std::string, size_t>> queue; // (payload, from_host, from_port)
+		bool has_sender = false;
+		struct sockaddr_storage sender = {};
+		socklen_t sender_len = 0;
+
+		~udp_listener_t() {
+			stop_listen();
+		}
+
+		void stop_listen() {
+			if (stop.exchange(true)) {
+				return;
+			}
+			if (sock != ngx_udp_invalid_socket) {
+				udp_close_socket(sock);
+				sock = ngx_udp_invalid_socket;
+			}
+			cv.notify_all();
+			if (thread.joinable()) {
+				thread.join();
+			}
+		}
+
+		void run() {
+#ifdef _WIN32
+			WSADATA wsa;
+			::WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+
+			char buf[65536];
+			while (!stop.load(std::memory_order_relaxed)) {
+				struct sockaddr_storage from = {};
+				socklen_t from_len = sizeof(from);
+				int n = ::recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr*)&from, &from_len);
+				if (n < 0) {
+					continue; // 500 ms timeout or transient error; re-check stop
+				}
+
+				char host_buf[NI_MAXHOST];
+				char port_buf[NI_MAXSERV];
+				if (::getnameinfo((struct sockaddr*)&from, from_len, host_buf, sizeof(host_buf), port_buf, sizeof(port_buf), NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+					continue;
+				}
+
+				{
+					std::lock_guard<std::mutex> guard(mutex);
+					queue.emplace_back(std::string(buf, (size_t)n), host_buf, (size_t)std::atoi(port_buf));
+					if (queue.size() > 4096) {
+						queue.pop_front(); // bounded
+					}
+					// remember the sender so udp_reply() can answer from this socket
+					sender = from;
+					sender_len = from_len;
+					has_sender = true;
+				}
+				cv.notify_one();
+			}
+
+#ifdef _WIN32
+			::WSACleanup();
+#endif
+		}
+	};
+
+	void ngx_lua_cpp_t::stop_impl() {
+		// stop UDP listeners first so queued recv waiters wake up cleanly
+		{
+			std::lock_guard<std::mutex> guard(listeners_mutex);
+			for (auto& [port, listener] : udp_listeners) {
+				listener->stop_listen();
+			}
+			udp_listeners.clear();
+		}
+
+		async_worker->terminate();
+		async_worker->join();
+
+		// manually polling events
+		while (main_warp->poll()) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
+
+		main_thread_index = ~(size_t)0;
+		reset_main_warp();
+	}
+
+	std::string ngx_lua_cpp_t::udp_listen(size_t port) {
+		if (port == 0 || port > 65535) {
+			return "invalid port";
+		}
+
+		std::lock_guard<std::mutex> guard(listeners_mutex);
+		if (udp_listeners.count(port) != 0) {
+			return "already listening on port " + std::to_string(port);
+		}
+
+		auto listener = std::make_shared<udp_listener_t>();
+		listener->port = port;
+
+#ifdef _WIN32
+		WSADATA wsa;
+		if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+			return "WSAStartup failed";
+		}
+#endif
+
+		listener->sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		if (listener->sock == ngx_udp_invalid_socket) {
+#ifdef _WIN32
+			::WSACleanup();
+#endif
+			return "socket() failed";
+		}
+
+		struct sockaddr_in addr = {};
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_ANY);
+		addr.sin_port = htons((uint16_t)port);
+		if (::bind(listener->sock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+			udp_close_socket(listener->sock);
+#ifdef _WIN32
+			::WSACleanup();
+#endif
+			return "bind() failed on port " + std::to_string(port) + " (already in use?)";
+		}
+
+		// periodic wake-up so the receive thread can observe stop()
+		udp_set_receive_timeout(listener->sock, 500);
+
+		listener->thread = std::thread([listener]() { listener->run(); });
+		udp_listeners[port] = listener;
+		return "";
+	}
+
+	iris_coroutine_t<ngx_lua_cpp_t::udp_packet_result_t> ngx_lua_cpp_t::udp_recv(size_t port, size_t timeout_ms) {
+		ngx_lua_cpp_t::udp_packet_result_t result; // (ok=false, "", "", 0, "")
+
+		// fast path: timeout_ms == 0 polls the queue on the caller thread.
+		// No worker-pool hop, no warp churn -- this is what the demo poll
+		// loops (udp_echo_server/syslog/dns) run hundreds of times a second.
+		if (timeout_ms == 0) {
+			std::shared_ptr<udp_listener_t> listener;
+			{
+				std::lock_guard<std::mutex> guard(listeners_mutex);
+				auto it = udp_listeners.find(port);
+				if (it == udp_listeners.end()) {
+					std::get<4>(result) = "not listening on port " + std::to_string(port);
+					co_return std::move(result);
+				}
+				listener = it->second;
+			}
+			{
+				std::lock_guard<std::mutex> lock(listener->mutex);
+				if (!listener->queue.empty()) {
+					auto& front = listener->queue.front();
+					std::get<0>(result) = true;
+					std::get<1>(result) = std::move(std::get<0>(front));
+					std::get<2>(result) = std::move(std::get<1>(front));
+					std::get<3>(result) = std::get<2>(front);
+					listener->queue.pop_front();
+				} else {
+					std::get<4>(result) = "timeout";
+				}
+			}
+			co_return std::move(result);
+		}
+
+		ngx_warp_t* main = co_await iris_switch<ngx_warp_t>(nullptr);
+
+		std::shared_ptr<udp_listener_t> listener;
+		{
+			std::lock_guard<std::mutex> guard(listeners_mutex);
+			auto it = udp_listeners.find(port);
+			if (it == udp_listeners.end()) {
+				std::get<4>(result) = "not listening on port " + std::to_string(port);
+				co_await iris_switch(main);
+				co_return std::move(result);
+			}
+			listener = it->second;
+		}
+
+		using udp_task_t = iris_awaitable_t<ngx_warp_t, std::function<udp_packet_result_t()>>;
+		udp_task_t task(main, std::function<udp_packet_result_t()>([listener, timeout_ms]() {
+			ngx_lua_cpp_t::udp_packet_result_t r;
+			std::unique_lock<std::mutex> lock(listener->mutex);
+
+			if (listener->queue.empty()) {
+				// wait for a datagram, the timeout, or listener shutdown;
+				// timeout_ms == 0 polls without blocking
+				listener->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [listener]() {
+					return !listener->queue.empty() || listener->stop.load(std::memory_order_relaxed);
+				});
+			}
+
+			if (!listener->queue.empty()) {
+				auto& front = listener->queue.front();
+				std::get<0>(r) = true;
+				std::get<1>(r) = std::move(std::get<0>(front));
+				std::get<2>(r) = std::move(std::get<1>(front));
+				std::get<3>(r) = std::get<2>(front);
+				listener->queue.pop_front();
+			} else {
+				std::get<4>(r) = "timeout";
+			}
+			return r;
+		}), 1);
+		task.dispatch();
+		result = co_await task;
+
+		co_await iris_switch(main);
+		co_return std::move(result);
+	}
+
+	iris_coroutine_t<std::tuple<bool, std::string>> ngx_lua_cpp_t::udp_send(std::string host, size_t port, std::string payload) {
+		std::tuple<bool, std::string> result = { false, "" };
+		ngx_warp_t* main = co_await iris_switch<ngx_warp_t>(nullptr);
+
+		using udp_task_t = iris_awaitable_t<ngx_warp_t, std::function<std::tuple<bool, std::string>()>>;
+		udp_task_t task(main, std::function<std::tuple<bool, std::string>()>([host, port, payload]() {
+			return udp_sendto_impl(host, port, payload);
+		}), 1);
+		task.dispatch();
+		result = co_await task;
+
+		co_await iris_switch(main);
+		co_return std::move(result);
+	}
+
+	iris_coroutine_t<std::tuple<bool, std::string>> ngx_lua_cpp_t::udp_reply(size_t port, std::string payload) {
+		std::tuple<bool, std::string> result = { false, "" };
+		ngx_warp_t* main = co_await iris_switch<ngx_warp_t>(nullptr);
+
+		std::shared_ptr<udp_listener_t> listener;
+		{
+			std::lock_guard<std::mutex> guard(listeners_mutex);
+			auto it = udp_listeners.find(port);
+			if (it == udp_listeners.end()) {
+				std::get<1>(result) = "not listening on port " + std::to_string(port);
+				co_await iris_switch(main);
+				co_return std::move(result);
+			}
+			listener = it->second;
+		}
+
+		using udp_task_t = iris_awaitable_t<ngx_warp_t, std::function<std::tuple<bool, std::string>()>>;
+		udp_task_t task(main, std::function<std::tuple<bool, std::string>()>([listener, payload]() {
+			std::tuple<bool, std::string> r = { false, "" };
+			sockaddr_storage sender;
+			socklen_t sender_len;
+			{
+				std::lock_guard<std::mutex> guard(listener->mutex);
+				if (!listener->has_sender) {
+					std::get<1>(r) = "no sender recorded for this port yet";
+					return r;
+				}
+				sender = listener->sender;
+				sender_len = listener->sender_len;
+			}
+			// send FROM the listening socket so the reply source address is
+			// the port the client sent to (connected clients require this)
+			int sent = ::sendto(listener->sock, payload.data(), (int)payload.size(), 0, (struct sockaddr*)&sender, sender_len);
+			if (sent < 0) {
+				std::get<1>(r) = "sendto failed";
+				return r;
+			}
+			std::get<0>(r) = true;
+			return r;
+		}), 1);
+		task.dispatch();
+		result = co_await task;
+
+		co_await iris_switch(main);
+		co_return std::move(result);
+	}
+
+	iris_coroutine_t<ngx_lua_cpp_t::udp_result_t> ngx_lua_cpp_t::udp_echo(std::string host, size_t port, std::string payload, size_t timeout_ms) {
+		ngx_lua_cpp_t::udp_result_t result;
+
+		// hop to the worker pool; the blocking socket exchange never touches
+		// the nginx thread (same offload pattern as fetch/mandelbrot).
+		ngx_warp_t* main = co_await iris_switch<ngx_warp_t>(nullptr);
+
+		using udp_task_t = iris_awaitable_t<ngx_warp_t, std::function<udp_result_t()>>;
+		udp_task_t task(main, std::function<udp_result_t()>([host, port, payload, timeout_ms]() {
+			return udp_roundtrip_impl(host, port, payload, timeout_ms);
+		}), 1);
+		task.dispatch();
+		result = co_await task;
+
+		co_await iris_switch(main);
+		co_return std::move(result);
+	}
+
+	// ---------------------------------------------------------------------------
+	// demo 6: crypto primitives (pure C++, no external deps)
+	// ---------------------------------------------------------------------------
+
+	namespace {
+		// ---- SHA-256 (FIPS 180-4) ----
+		struct sha256_ctx_t {
+			uint32_t state[8];
+			uint64_t bit_len = 0;
+			uint8_t buffer[64] = {};
+			size_t buffer_len = 0;
+		};
+
+		constexpr uint32_t sha256_k[64] = {
+			0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+			0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+			0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+			0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+			0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+			0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+			0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+			0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+		};
+
+		uint32_t sha256_rotr(uint32_t x, unsigned n) {
+			return (x >> n) | (x << (32 - n));
+		}
+
+		void sha256_transform(sha256_ctx_t& ctx, const uint8_t* block) {
+			uint32_t w[64];
+			for (unsigned i = 0; i < 16; i++) {
+				w[i] = ((uint32_t)block[i * 4] << 24) | ((uint32_t)block[i * 4 + 1] << 16) |
+					((uint32_t)block[i * 4 + 2] << 8) | (uint32_t)block[i * 4 + 3];
+			}
+			for (unsigned i = 16; i < 64; i++) {
+				uint32_t s0 = sha256_rotr(w[i - 15], 7) ^ sha256_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+				uint32_t s1 = sha256_rotr(w[i - 2], 17) ^ sha256_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+				w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+			}
+
+			uint32_t a = ctx.state[0], b = ctx.state[1], c = ctx.state[2], d = ctx.state[3];
+			uint32_t e = ctx.state[4], f = ctx.state[5], g = ctx.state[6], h = ctx.state[7];
+
+			for (unsigned i = 0; i < 64; i++) {
+				uint32_t S1 = sha256_rotr(e, 6) ^ sha256_rotr(e, 11) ^ sha256_rotr(e, 25);
+				uint32_t ch = (e & f) ^ (~e & g);
+				uint32_t temp1 = h + S1 + ch + sha256_k[i] + w[i];
+				uint32_t S0 = sha256_rotr(a, 2) ^ sha256_rotr(a, 13) ^ sha256_rotr(a, 22);
+				uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+				uint32_t temp2 = S0 + maj;
+				h = g; g = f; f = e; e = d + temp1;
+				d = c; c = b; b = a; a = temp1 + temp2;
+			}
+
+			ctx.state[0] += a; ctx.state[1] += b; ctx.state[2] += c; ctx.state[3] += d;
+			ctx.state[4] += e; ctx.state[5] += f; ctx.state[6] += g; ctx.state[7] += h;
+		}
+
+		void sha256_init(sha256_ctx_t& ctx) {
+			ctx.state[0] = 0x6a09e667; ctx.state[1] = 0xbb67ae85;
+			ctx.state[2] = 0x3c6ef372; ctx.state[3] = 0xa54ff53a;
+			ctx.state[4] = 0x510e527f; ctx.state[5] = 0x9b05688c;
+			ctx.state[6] = 0x1f83d9ab; ctx.state[7] = 0x5be0cd19;
+			ctx.bit_len = 0;
+			ctx.buffer_len = 0;
+		}
+
+		void sha256_update(sha256_ctx_t& ctx, const uint8_t* data, size_t len) {
+			ctx.bit_len += (uint64_t)len * 8;
+			while (len > 0) {
+				size_t take = std::min(len, 64 - ctx.buffer_len);
+				std::memcpy(ctx.buffer + ctx.buffer_len, data, take);
+				ctx.buffer_len += take;
+				data += take;
+				len -= take;
+				if (ctx.buffer_len == 64) {
+					sha256_transform(ctx, ctx.buffer);
+					ctx.buffer_len = 0;
+				}
+			}
+		}
+
+		std::string sha256_final_hex(sha256_ctx_t& ctx) {
+			// append 0x80, zeros, then the 8-byte big-endian bit length,
+			// WITHOUT touching ctx.bit_len (it must stay the message length)
+			const uint64_t bits = ctx.bit_len;
+			uint8_t pad[128];
+			size_t pad_len = 0;
+			pad[pad_len++] = 0x80;
+			size_t zeros = (ctx.buffer_len < 56) ? (56 - ctx.buffer_len - 1) : (120 - ctx.buffer_len - 1);
+			std::memset(pad + pad_len, 0, zeros);
+			pad_len += zeros;
+			for (int i = 7; i >= 0; i--) {
+				pad[pad_len++] = (uint8_t)(bits >> (i * 8));
+			}
+
+			size_t off = 0;
+			while (off < pad_len) {
+				size_t take = std::min(pad_len - off, 64 - ctx.buffer_len);
+				std::memcpy(ctx.buffer + ctx.buffer_len, pad + off, take);
+				ctx.buffer_len += take;
+				off += take;
+				if (ctx.buffer_len == 64) {
+					sha256_transform(ctx, ctx.buffer);
+					ctx.buffer_len = 0;
+				}
+			}
+
+			static const char* hexdigits = "0123456789abcdef";
+			std::string out;
+			out.reserve(64);
+			for (uint32_t v : ctx.state) {
+				for (int shift = 28; shift >= 0; shift -= 4) {
+					out.push_back(hexdigits[(v >> shift) & 0xf]);
+				}
+			}
+			return out;
+		}
+
+		std::string sha256_hex_impl(const std::string& data) {
+			sha256_ctx_t ctx;
+			sha256_init(ctx);
+			sha256_update(ctx, reinterpret_cast<const uint8_t*>(data.data()), data.size());
+			return sha256_final_hex(ctx);
+		}
+
+		std::string hmac_sha256_raw_impl(const std::string& key, const std::string& data) {
+			std::string k = key;
+			if (k.size() > 64) {
+				std::string digest = sha256_hex_impl(k);
+				std::string raw;
+				raw.reserve(32);
+				for (size_t i = 0; i + 1 < digest.size(); i += 2) {
+					auto nib = [](char c) -> uint8_t {
+						if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+						return (uint8_t)((c | 0x20) - 'a' + 10);
+					};
+					raw.push_back((char)((nib(digest[i]) << 4) | nib(digest[i + 1])));
+				}
+				k = std::move(raw);
+			}
+			uint8_t ipad[64], opad[64];
+			std::memset(ipad, 0x36, sizeof(ipad));
+			std::memset(opad, 0x5c, sizeof(opad));
+			for (size_t i = 0; i < k.size(); i++) {
+				ipad[i] ^= (uint8_t)k[i];
+				opad[i] ^= (uint8_t)k[i];
+			}
+
+			sha256_ctx_t inner;
+			sha256_init(inner);
+			sha256_update(inner, ipad, sizeof(ipad));
+			sha256_update(inner, reinterpret_cast<const uint8_t*>(data.data()), data.size());
+			std::string inner_hex = sha256_final_hex(inner);
+
+			std::string inner_raw;
+			inner_raw.reserve(32);
+			for (size_t i = 0; i + 1 < inner_hex.size(); i += 2) {
+				auto nib = [](char c) -> uint8_t {
+					if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+					return (uint8_t)((c | 0x20) - 'a' + 10);
+				};
+				inner_raw.push_back((char)((nib(inner_hex[i]) << 4) | nib(inner_hex[i + 1])));
+			}
+
+			sha256_ctx_t outer;
+			sha256_init(outer);
+			sha256_update(outer, opad, sizeof(opad));
+			sha256_update(outer, reinterpret_cast<const uint8_t*>(inner_raw.data()), inner_raw.size());
+			std::string outer_hex = sha256_final_hex(outer);
+
+			std::string out;
+			out.reserve(32);
+			for (size_t i = 0; i + 1 < outer_hex.size(); i += 2) {
+				auto nib = [](char c) -> uint8_t {
+					if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+					return (uint8_t)((c | 0x20) - 'a' + 10);
+				};
+				out.push_back((char)((nib(outer_hex[i]) << 4) | nib(outer_hex[i + 1])));
+			}
+			return out;
+		}
+
+		std::string hmac_sha256_hex_impl(const std::string& key, const std::string& data) {
+			const std::string raw = hmac_sha256_raw_impl(key, data);
+			static const char* hexdigits = "0123456789abcdef";
+			std::string out;
+			out.reserve(64);
+			for (unsigned char c : raw) {
+				out.push_back(hexdigits[c >> 4]);
+				out.push_back(hexdigits[c & 0xf]);
+			}
+			return out;
+		}
+
+		constexpr char b64url_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+		std::string base64url_encode_impl(const std::string& in) {
+			std::string out;
+			out.reserve((in.size() + 2) / 3 * 4);
+			for (size_t i = 0; i < in.size(); i += 3) {
+				uint32_t v = (uint8_t)in[i] << 16;
+				if (i + 1 < in.size()) v |= (uint8_t)in[i + 1] << 8;
+				if (i + 2 < in.size()) v |= (uint8_t)in[i + 2];
+				out.push_back(b64url_table[(v >> 18) & 0x3f]);
+				out.push_back(b64url_table[(v >> 12) & 0x3f]);
+				if (i + 1 < in.size()) out.push_back(b64url_table[(v >> 6) & 0x3f]);
+				if (i + 2 < in.size()) out.push_back(b64url_table[v & 0x3f]);
+			}
+			return out;
+		}
+
+		std::string base64url_decode_impl(const std::string& in, bool& ok) {
+			ok = false;
+			std::string out;
+			out.reserve(in.size() * 3 / 4);
+			uint32_t buf = 0;
+			int bits = 0;
+			for (char c : in) {
+				if (c == '=') break;
+				uint8_t v;
+				if (c >= 'A' && c <= 'Z') v = (uint8_t)(c - 'A');
+				else if (c >= 'a' && c <= 'z') v = (uint8_t)(c - 'a' + 26);
+				else if (c >= '0' && c <= '9') v = (uint8_t)(c - '0' + 52);
+				else if (c == '-') v = 62;
+				else if (c == '_') v = 63;
+				else return out; // invalid char
+				buf = (buf << 6) | v;
+				bits += 6;
+				if (bits >= 8) {
+					bits -= 8;
+					out.push_back((char)((buf >> bits) & 0xff));
+				}
+			}
+			ok = true;
+			return out;
+		}
+
+		std::string random_hex_impl(size_t nbytes) {
+			static std::mt19937_64 rng{ std::random_device{}() };
+			static const char* hexdigits = "0123456789abcdef";
+			std::string out;
+			out.reserve(nbytes * 2);
+			for (size_t i = 0; i < nbytes; i++) {
+				uint64_t r = rng();
+				out.push_back(hexdigits[r & 0xf]);
+				out.push_back(hexdigits[(r >> 4) & 0xf]);
+			}
+			return out;
+		}
+
+		// ---- log line timestamp -> unix seconds (civil days algorithm) ----
+		const char* log_months[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+		double log_parse_time(const char* s, size_t len) {
+			// expect [dd/Mon/yyyy:HH:MM:SS
+			if (len < 20 || s[0] != '[') return 0;
+			int day = 0, year = 0, hh = 0, mi = 0, ss = 0;
+			int month = -1;
+			for (int i = 0; i < 2; i++) day = day * 10 + (s[1 + i] - '0');
+			for (int m = 0; m < 12; m++) {
+				if (std::strncmp(s + 4, log_months[m], 3) == 0) { month = m + 1; break; }
+			}
+			for (int i = 0; i < 4; i++) year = year * 10 + (s[8 + i] - '0');
+			hh = (s[13] - '0') * 10 + (s[14] - '0');
+			mi = (s[16] - '0') * 10 + (s[17] - '0');
+			ss = (s[19] - '0') * 10 + (s[20] - '0');
+			if (month < 0) return 0;
+
+			// days_from_civil (Howard Hinnant)
+			int y = year - (month <= 2 ? 1 : 0);
+			int era = (y >= 0 ? y : y - 399) / 400;
+			unsigned yoe = (unsigned)(y - era * 400);
+			unsigned mp = (unsigned)(month + (month > 2 ? -3 : 9));
+			unsigned doy = (153 * mp + 2) / 5 + (unsigned)day - 1;
+			unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+			long long days = (long long)era * 146097 + (long long)doe - 719468;
+			return (double)days * 86400.0 + (double)(hh * 3600 + mi * 60 + ss);
+		}
+	}
+
+	std::string ngx_lua_cpp_t::sha256(const std::string& data) {
+		return sha256_hex_impl(data);
+	}
+
+	std::string ngx_lua_cpp_t::hmac_sha256(const std::string& key, const std::string& data) {
+		return hmac_sha256_hex_impl(key, data);
+	}
+
+	std::string ngx_lua_cpp_t::hmac_sha256_raw(const std::string& key, const std::string& data) {
+		return hmac_sha256_raw_impl(key, data);
+	}
+
+	std::string ngx_lua_cpp_t::base64url_encode(const std::string& data) {
+		return base64url_encode_impl(data);
+	}
+
+	std::tuple<std::string, std::string> ngx_lua_cpp_t::base64url_decode(const std::string& data) {
+		bool ok = false;
+		std::string out = base64url_decode_impl(data, ok);
+		if (!ok) {
+			return { std::string(), "invalid base64url input" };
+		}
+		return { std::move(out), std::string() };
+	}
+
+	std::string ngx_lua_cpp_t::random_hex(size_t nbytes) {
+		return random_hex_impl(std::clamp(nbytes, size_t(1), size_t(1024)));
+	}
+
+	// ---------------------------------------------------------------------------
+	// demo 7: event bus + LRU cache (cross-request shared C++ state)
+	// ---------------------------------------------------------------------------
+
+	struct ngx_lua_cpp_t::event_bus_t {
+		std::mutex mutex;
+		double next_id = 1;
+		std::map<std::string, std::deque<bus_event_t>> topics;
+
+		void pub(const std::string& topic, const std::string& payload) {
+			std::lock_guard<std::mutex> guard(mutex);
+			auto& q = topics[topic];
+			double id = next_id++;
+			double ts = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+			q.emplace_back(id, ts, payload);
+			if (q.size() > 512) {
+				q.pop_front();
+			}
+		}
+
+		std::pair<std::vector<bus_event_t>, double> poll(const std::string& topic, double last_id) {
+			std::lock_guard<std::mutex> guard(mutex);
+			std::vector<bus_event_t> out;
+			double next = last_id;
+			auto it = topics.find(topic);
+			if (it != topics.end()) {
+				for (const auto& e : it->second) {
+					if (std::get<0>(e) > last_id) {
+						out.push_back(e);
+						next = std::get<0>(e);
+					}
+				}
+			}
+			return { std::move(out), next };
+		}
+	};
+
+	struct ngx_lua_cpp_t::lru_cache_t {
+		static double now_ms() {
+			return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		}
+
+		std::mutex mutex;
+		size_t max_entries = 1024;
+		size_t hits = 0;
+		size_t misses = 0;
+		size_t evictions = 0;
+		std::list<std::string> lru; // front = most recently used
+		std::map<std::string, std::pair<std::string, double>> entries; // key -> (value, expire_ts_ms; 0 = never)
+		std::map<std::string, std::list<std::string>::iterator> iters;
+
+		bool set(const std::string& key, const std::string& value, double ttl_ms) {
+			std::lock_guard<std::mutex> guard(mutex);
+			double now = now_ms();
+			double expire = ttl_ms > 0 ? now + ttl_ms : 0.0;
+			auto it = entries.find(key);
+			if (it != entries.end()) {
+				it->second = { value, expire };
+				lru.splice(lru.begin(), lru, iters[key]);
+				return true;
+			}
+			if (entries.size() >= max_entries) {
+				std::string victim = lru.back();
+				lru.pop_back();
+				entries.erase(victim);
+				iters.erase(victim);
+				evictions++;
+			}
+			entries[key] = { value, expire };
+			lru.push_front(key);
+			iters[key] = lru.begin();
+			return true;
+		}
+
+		std::tuple<bool, std::string, double> get(const std::string& key) {
+			std::lock_guard<std::mutex> guard(mutex);
+			auto it = entries.find(key);
+			if (it == entries.end()) {
+				misses++;
+				return { false, std::string(), 0.0 };
+			}
+			double now = now_ms();
+			if (it->second.second > 0 && now >= it->second.second) {
+				entries.erase(it);
+				lru.erase(iters[key]);
+				iters.erase(key);
+				misses++;
+				return { false, std::string(), 0.0 };
+			}
+			hits++;
+			lru.splice(lru.begin(), lru, iters[key]);
+			double remain = it->second.second > 0 ? it->second.second - now : 0.0;
+			return { true, it->second.first, remain };
+		}
+
+		std::map<std::string, double> stats() {
+			std::lock_guard<std::mutex> guard(mutex);
+			return {
+				{ "entries", (double)entries.size() },
+				{ "max_entries", (double)max_entries },
+				{ "hits", (double)hits },
+				{ "misses", (double)misses },
+				{ "evictions", (double)evictions },
+			};
+		}
+	};
+
+	void ngx_lua_cpp_t::pub(const std::string& topic, const std::string& payload) {
+		event_bus->pub(topic, payload);
+	}
+
+	std::tuple<std::vector<ngx_lua_cpp_t::bus_event_t>, double> ngx_lua_cpp_t::events(const std::string& topic, double last_id) {
+		auto r = event_bus->poll(topic, last_id);
+		return { std::move(r.first), r.second };
+	}
+
+	bool ngx_lua_cpp_t::cache_set(const std::string& key, const std::string& value, double ttl_ms) {
+		return lru_cache->set(key, value, std::clamp(ttl_ms, 0.0, 86400000.0));
+	}
+
+	std::tuple<bool, std::string, double> ngx_lua_cpp_t::cache_get(const std::string& key) {
+		return lru_cache->get(key);
+	}
+
+	std::map<std::string, double> ngx_lua_cpp_t::cache_stats() {
+		return lru_cache->stats();
+	}
+
+	// ---------------------------------------------------------------------------
+	// demo 8: file hashing + log analysis (blocking I/O on the worker pool)
+	// ---------------------------------------------------------------------------
+
+	iris_coroutine_t<std::tuple<std::string, double, double>> ngx_lua_cpp_t::file_sha256(std::string path) {
+		std::tuple<std::string, double, double> result; // (hex, size_bytes, elapsed_ms)
+		ngx_warp_t* main = co_await iris_switch<ngx_warp_t>(nullptr);
+
+		const auto t0 = std::chrono::steady_clock::now();
+		sha256_ctx_t ctx;
+		sha256_init(ctx);
+		double size_bytes = 0;
+		FILE* f = ngx_file_open_read(path);
+		if (f == nullptr) {
+			std::get<0>(result) = "file not found";
+		} else {
+			char buf[65536];
+			size_t n;
+			while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+				sha256_update(ctx, reinterpret_cast<const uint8_t*>(buf), n);
+				size_bytes += (double)n;
+			}
+			std::fclose(f);
+			std::get<0>(result) = sha256_final_hex(ctx);
+			std::get<1>(result) = size_bytes;
+		}
+
+		std::get<2>(result) = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+		co_await iris_switch(main);
+		co_return std::move(result);
+	}
+
+	iris_coroutine_t<ngx_lua_cpp_t::log_stats_t> ngx_lua_cpp_t::log_analyze(std::string path, double max_lines) {
+		ngx_lua_cpp_t::log_stats_t result;
+		ngx_warp_t* main = co_await iris_switch<ngx_warp_t>(nullptr);
+
+		auto& stats = std::get<0>(result);
+		auto& top_urls = std::get<1>(result);
+		auto& statuses = std::get<2>(result);
+		auto& per_second = std::get<3>(result);
+
+		const auto t0 = std::chrono::steady_clock::now();
+		std::map<std::string, double> url_counts;
+		std::map<double, double> second_counts;
+		std::map<std::string, double> status_counts;
+		double lines = 0, total = 0, first_ts = 0, last_ts = 0;
+
+		FILE* f = ngx_file_open_read(path);
+		if (f == nullptr) {
+			stats["error"] = 1.0;
+			stats["errno"] = (double)errno;
+			stats["elapsed_ms"] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+			co_await iris_switch(main);
+			co_return std::move(result);
+		}
+
+		const double max_lines_d = max_lines > 0 ? max_lines : 100000;
+		std::string line;
+		line.reserve(1024);
+		char c;
+		bool skip_to_newline = false;
+		while ((c = (char)std::fgetc(f)) != EOF) {
+			if (skip_to_newline) {
+				if (c == '\n') { skip_to_newline = false; }
+				continue;
+			}
+			if (c == '\n') {
+				lines++;
+				// parse: "ip - - [ts] \"METHOD /path HTTP/x.y\" STATUS BYTES ..."
+				size_t ts_start = line.find('[');
+				size_t quote1 = line.find('"');
+				size_t quote2 = quote1 == std::string::npos ? std::string::npos : line.find('"', quote1 + 1);
+				size_t http_pos = line.find("HTTP/");
+				if (ts_start != std::string::npos && quote1 != std::string::npos && quote2 != std::string::npos && http_pos != std::string::npos && http_pos < quote2) {
+					double ts = log_parse_time(line.data() + ts_start, line.size() - ts_start);
+					// request line between the quotes
+					std::string req = line.substr(quote1 + 1, quote2 - quote1 - 1);
+					// status code after the closing quote
+					size_t p = quote2 + 1;
+					while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) p++;
+					size_t status_start = p;
+					while (p < line.size() && line[p] >= '0' && line[p] <= '9') p++;
+					std::string status = line.substr(status_start, p - status_start);
+
+					if (ts > 0 && !status.empty()) {
+						total++;
+						if (first_ts == 0) first_ts = ts;
+						last_ts = ts;
+						second_counts[ts] += 1;
+						status_counts[status] += 1;
+						// request URL: "GET /path HTTP/1.1"
+						size_t sp1 = req.find(' ');
+						size_t sp2 = sp1 == std::string::npos ? std::string::npos : req.find(' ', sp1 + 1);
+						if (sp1 != std::string::npos && sp2 != std::string::npos) {
+							url_counts[req.substr(sp1 + 1, sp2 - sp1 - 1)] += 1;
+						}
+					}
+				}
+				if (lines >= max_lines_d) {
+					skip_to_newline = true; // stop parsing but drain the file
+					break;
+				}
+				line.clear();
+				continue;
+			}
+			line.push_back(c);
+		}
+		std::fclose(f);
+
+		// top urls (up to 20, sorted desc)
+		std::vector<std::pair<std::string, double>> url_vec(url_counts.begin(), url_counts.end());
+		std::sort(url_vec.begin(), url_vec.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+		for (size_t i = 0; i < url_vec.size() && i < 20; i++) {
+			top_urls.emplace_back(std::move(url_vec[i].first), url_vec[i].second);
+		}
+
+		// statuses sorted numerically
+		std::vector<std::pair<std::string, double>> status_vec(status_counts.begin(), status_counts.end());
+		std::sort(status_vec.begin(), status_vec.end(), [](const auto& a, const auto& b) {
+			double na = std::atof(a.first.c_str());
+			double nb = std::atof(b.first.c_str());
+			return na < nb;
+		});
+		for (auto& s : status_vec) {
+			statuses.emplace_back(std::move(s.first), s.second);
+		}
+
+		// per-second buckets: last up to 60, relative index 0 = oldest
+		std::vector<std::pair<double, double>> sec_vec(second_counts.begin(), second_counts.end());
+		std::sort(sec_vec.begin(), sec_vec.end());
+		size_t n = sec_vec.size();
+		for (size_t i = n > 60 ? n - 60 : 0; i < n; i++) {
+			per_second.emplace_back((double)(i - (n > 60 ? n - 60 : 0)), sec_vec[i].second);
+		}
+
+		double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		stats["lines"] = lines;
+		stats["total"] = total;
+		stats["status_2xx"] = status_counts["200"] + status_counts["201"] + status_counts["202"] + status_counts["204"];
+		stats["status_3xx"] = status_counts["301"] + status_counts["302"] + status_counts["304"] + status_counts["307"];
+		stats["status_4xx"] = status_counts["400"] + status_counts["401"] + status_counts["403"] + status_counts["404"] + status_counts["429"];
+		stats["status_5xx"] = status_counts["500"] + status_counts["502"] + status_counts["503"] + status_counts["504"];
+		stats["qps"] = (last_ts > first_ts && total > 0) ? total / (last_ts - first_ts) : 0.0;
+		stats["span_seconds"] = last_ts > first_ts ? last_ts - first_ts : 0.0;
+		stats["elapsed_ms"] = elapsed;
+
+		co_await iris_switch(main);
+		co_return std::move(result);
+	}
+
+	// ---------------------------------------------------------------------------
 	// demo 3: in-memory job queue
 	// ---------------------------------------------------------------------------
 
@@ -898,6 +1993,7 @@ namespace iris {
 			std::lock_guard<std::mutex> guard(jobs_mutex);
 			job->status = "running";
 		}
+		event_bus->pub("jobs", job->id + "|" + job->kind + "|running|0.0|0.0");
 
 		std::string result_text;
 		bool failed = false;
@@ -942,6 +2038,9 @@ namespace iris {
 					std::lock_guard<std::mutex> guard(jobs_mutex);
 					job->progress = (double)(c + 1) / (double)chunks;
 				}
+				event_bus->pub("jobs", job->id + "|" + job->kind + "|running|" +
+					std::to_string(job->progress) + "|" +
+					std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()));
 				co_await iris_switch<ngx_warp_t>(nullptr);
 			}
 
@@ -960,6 +2059,9 @@ namespace iris {
 					std::lock_guard<std::mutex> guard(jobs_mutex);
 					job->progress = (double)(s + 1) / (double)steps;
 				}
+				event_bus->pub("jobs", job->id + "|" + job->kind + "|running|" +
+					std::to_string(job->progress) + "|" +
+					std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()));
 				co_await iris_switch<ngx_warp_t>(nullptr);
 			}
 
@@ -976,6 +2078,8 @@ namespace iris {
 			job->result = result_text;
 			job->elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 		}
+		event_bus->pub("jobs", job->id + "|" + job->kind + "|" + (failed ? "failed" : "done") + "|1.0|" +
+			std::to_string(job->elapsed_ms));
 		co_return;
 	}
 
@@ -996,6 +2100,24 @@ namespace iris {
 		// demos
 		lua.set_current<&ngx_lua_cpp_t::mandelbrot>("mandelbrot");
 		lua.set_current<&ngx_lua_cpp_t::fetch>("fetch");
+		lua.set_current<&ngx_lua_cpp_t::udp_echo>("udp_echo");
+		lua.set_current<&ngx_lua_cpp_t::udp_listen>("udp_listen");
+		lua.set_current<&ngx_lua_cpp_t::udp_recv>("udp_recv");
+		lua.set_current<&ngx_lua_cpp_t::udp_send>("udp_send");
+		lua.set_current<&ngx_lua_cpp_t::udp_reply>("udp_reply");
+		lua.set_current<&ngx_lua_cpp_t::sha256>("sha256");
+		lua.set_current<&ngx_lua_cpp_t::hmac_sha256>("hmac_sha256");
+		lua.set_current<&ngx_lua_cpp_t::hmac_sha256_raw>("hmac_sha256_raw");
+		lua.set_current<&ngx_lua_cpp_t::base64url_encode>("base64url_encode");
+		lua.set_current<&ngx_lua_cpp_t::base64url_decode>("base64url_decode");
+		lua.set_current<&ngx_lua_cpp_t::random_hex>("random_hex");
+		lua.set_current<&ngx_lua_cpp_t::pub>("pub");
+		lua.set_current<&ngx_lua_cpp_t::events>("events");
+		lua.set_current<&ngx_lua_cpp_t::cache_set>("cache_set");
+		lua.set_current<&ngx_lua_cpp_t::cache_get>("cache_get");
+		lua.set_current<&ngx_lua_cpp_t::cache_stats>("cache_stats");
+		lua.set_current<&ngx_lua_cpp_t::file_sha256>("file_sha256");
+		lua.set_current<&ngx_lua_cpp_t::log_analyze>("log_analyze");
 		lua.set_current<&ngx_lua_cpp_t::job_submit>("job_submit");
 		lua.set_current<&ngx_lua_cpp_t::job_query>("job_query");
 		lua.set_current<&ngx_lua_cpp_t::job_list>("job_list");
@@ -1049,4 +2171,5 @@ extern "C" NGX_LUA_CPP_API int luaopen_ngx_lua_cpp(lua_State* L) {
 		return lua.make_type<iris::ngx_lua_cpp_t>();
 	});
 }
+
 
