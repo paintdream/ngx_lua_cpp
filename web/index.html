@@ -674,6 +674,13 @@ body {
     <button class="tab-btn" data-tab="mandelbrot" onclick="switchTab('mandelbrot')">&#127756; Mandelbrot 并行渲染</button>
     <button class="tab-btn" data-tab="fetch" onclick="switchTab('fetch')">&#128230; 并发抓取</button>
     <button class="tab-btn" data-tab="jobs" onclick="switchTab('jobs')">&#9203; 任务队列</button>
+    <button class="tab-btn" data-tab="udp" onclick="switchTab('udp')">&#128225; UDP 数据报</button>
+    <button class="tab-btn" data-tab="realtime" onclick="switchTab('realtime')">&#128250; 实时推送</button>
+    <button class="tab-btn" data-tab="gateway" onclick="switchTab('gateway')">&#128274; 安全网关</button>
+    <button class="tab-btn" data-tab="cache" onclick="switchTab('cache')">&#128190; 缓存</button>
+    <button class="tab-btn" data-tab="upload" onclick="switchTab('upload')">&#128229; 上传哈希</button>
+    <button class="tab-btn" data-tab="logstats" onclick="switchTab('logstats')">&#128200; 日志分析</button>
+    <button class="tab-btn" data-tab="dns" onclick="switchTab('dns')">&#127760; DNS</button>
     <button class="tab-btn" data-tab="logs" onclick="switchTab('logs')">&#128220; 日志</button>
 </div>
 
@@ -710,6 +717,10 @@ local inst = require("init_ngx_lua_cpp")
 -- print("job id:", id)
 -- local q = inst:job_query(id)
 -- print("status:", q[1], "progress:", q[2], "result:", q[4])
+
+-- 5) UDP round-trip: datagram to the stream UDP echo listener (port 9000)
+-- local r = inst:udp_echo("127.0.0.1", 9000, "hello-udp", 2000)
+-- print("udp ok:", r[1], "reply:", r[2], "ms:", r[3])
 
 print("ngx_lua_cpp running:", inst:is_running())</textarea>
             </div>
@@ -827,6 +838,177 @@ http://127.0.0.1:8080/</textarea>
                         <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>进度</th><th>耗时(ms)</th><th>结果</th></tr></thead>
                         <tbody id="jb-list"></tbody>
                     </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Tab: UDP ============ -->
+    <div id="page-udp" class="tab-page">
+        <div class="panel">
+            <div class="demo-controls">
+                <div class="control-group"><label>目标主机</label><input type="text" id="udp-host" value="127.0.0.1" class="wide"></div>
+                <div class="control-group"><label>端口</label><input type="number" id="udp-port" value="9000" min="1" max="65535"></div>
+                <div class="control-group"><label>超时(ms)</label><input type="number" id="udp-timeout" value="2000" min="50" max="30000"></div>
+                <div class="control-group"><label>载荷</label><input type="text" id="udp-payload" value="hello-udp" class="wide"></div>
+                <button class="btn btn-primary" onclick="sendUdp()">&#128225; 发送 UDP 数据报</button>
+            </div>
+            <div class="preset-row">
+                <span class="hint">浏览器 → /api/udp (HTTP) → ngx_lua_cpp:udp_echo（阻塞式 Winsock 跑在 C++ 线程池上）→ 9000 端口 UDP 回显（由 C++ 实例持有监听，Lua 协程驱动）→ 回包。9001 = 纯 Lua 固定回复。nginx 的 stream 模块在 Windows 上无法声明 "listen ... udp"（ngx_stream_core_module.c 中 #if !(NGX_WIN32)），所以监听由 ngx_lua_cpp 自己绑定。命令行探测：powershell -File web/udp-probe.ps1 -All。</span>
+            </div>
+            <div class="demo-content">
+                <div class="card">
+                    <h3>往返结果</h3>
+                    <pre id="udp-result" class="log-content" style="min-height:90px;">未发送。</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Tab: Realtime (WebSocket / SSE / syslog) ============ -->
+    <div id="page-realtime" class="tab-page">
+        <div class="panel">
+            <div class="demo-controls">
+                <div class="control-group"><label>主题</label>
+                    <select id="rt-topic">
+                        <option value="syslog">syslog（系统日志墙）</option>
+                        <option value="udp">udp（UDP 流量）</option>
+                        <option value="jobs">jobs（任务进度）</option>
+                        <option value="webhook">webhook（钩子事件）</option>
+                        <option value="dns">dns（解析事件）</option>
+                        <option value="test">test（手动发布）</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary" id="rt-connect-btn" onclick="rtConnect()">&#128250; 连接 WebSocket</button>
+                <button class="btn" onclick="rtDisconnect()">断开</button>
+                <button class="btn" onclick="rtPublishTest()">&#10133; 发布测试事件</button>
+                <button class="btn" onclick="rtClear()">清空</button>
+            </div>
+            <div class="preset-row">
+                <span class="hint">浏览器 WebSocket → /ws → C++ 事件总线（<b>inst:pub / inst:events</b>）。打开"UDP 数据报"页发一个包，或发一条 syslog，事件会实时推到这里。SSE 版本：curl http://localhost:8080/api/stream?topic=syslog</span>
+            </div>
+            <div class="demo-content" style="display:flex;gap:12px;flex-wrap:wrap;">
+                <div class="card" style="flex:1;min-width:320px;">
+                    <h3>事件流 <span id="rt-status" style="color:var(--text-muted);font-weight:400;"></span></h3>
+                    <pre id="rt-events" class="log-content" style="min-height:220px;max-height:360px;">未连接。</pre>
+                </div>
+                <div class="card" style="flex:1;min-width:260px;">
+                    <h3>syslog 最近消息</h3>
+                    <div id="rt-syslog-list" class="log-content" style="min-height:220px;max-height:360px;">加载中...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Tab: Gateway (JWT + rate limit + webhook) ============ -->
+    <div id="page-gateway" class="tab-page">
+        <div class="panel">
+            <div class="demo-controls">
+                <div class="control-group"><label>用户</label><input type="text" id="gw-user" value="alice" class="wide"></div>
+                <div class="control-group"><label>密钥</label><input type="text" id="gw-secret" value="demo-secret" class="wide"></div>
+                <button class="btn btn-primary" onclick="gwLogin()">&#128273; 登录（签发 JWT）</button>
+                <button class="btn" onclick="gwCall(true)">&#9989; 带 Token 调受保护 API</button>
+                <button class="btn" onclick="gwCall(false)">&#10060; 不带 Token（预期 401）</button>
+                <button class="btn" onclick="gwFlood()">&#128165; 限流测试（快速连打）</button>
+            </div>
+            <div class="preset-row">
+                <span class="hint">HS256 JWT：签名由 C++ 的 <b>hmac_sha256_raw</b> 完成；<b>access_by_lua</b> 做验签 + resty.limit.req 限流（10 req/s，burst 20）。Webhook：下方用浏览器 crypto.subtle 计算 HMAC 签名后投递。</span>
+            </div>
+            <div class="demo-content" style="display:flex;gap:12px;flex-wrap:wrap;">
+                <div class="card" style="flex:1;min-width:320px;">
+                    <h3>Token 与调用结果</h3>
+                    <pre id="gw-result" class="log-content" style="min-height:160px;">未操作。</pre>
+                </div>
+                <div class="card" style="flex:1;min-width:320px;">
+                    <h3>Webhook 投递</h3>
+                    <div class="demo-controls" style="margin:0 0 8px 0;">
+                        <div class="control-group"><label>payload</label><input type="text" id="gw-wh-payload" value='{"kind":"count_primes","payload":{"limit":5000000}}' class="wide"></div>
+                        <button class="btn btn-primary" onclick="gwWebhook()">&#128228; 签名并投递</button>
+                    </div>
+                    <pre id="gw-webhook-result" class="log-content" style="min-height:120px;">未投递。</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Tab: Cache ============ -->
+    <div id="page-cache" class="tab-page">
+        <div class="panel">
+            <div class="demo-controls">
+                <div class="control-group"><label>key</label><input type="text" id="ca-key" value="hello" class="wide"></div>
+                <div class="control-group"><label>value</label><input type="text" id="ca-value" value="world" class="wide"></div>
+                <div class="control-group"><label>TTL(ms)</label><input type="number" id="ca-ttl" value="60000"></div>
+                <button class="btn btn-primary" onclick="caSet()">&#128190; 写入</button>
+                <button class="btn" onclick="caGet()">读取</button>
+                <button class="btn" onclick="caStats()">统计</button>
+                <button class="btn" onclick="caCompute()">&#9889; 计算型缓存 demo</button>
+            </div>
+            <div class="preset-row">
+                <span class="hint">C++ LRU 缓存（TTL + 淘汰），跨请求共享。计算型 demo：miss 时在 C++ 线程池上"计算"200ms 后入缓存，第二次请求直接命中。</span>
+            </div>
+            <div class="demo-content">
+                <div class="card">
+                    <h3>结果</h3>
+                    <pre id="ca-result" class="log-content" style="min-height:120px;">未操作。</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Tab: Upload ============ -->
+    <div id="page-upload" class="tab-page">
+        <div class="panel">
+            <div class="demo-controls">
+                <div class="control-group"><label>文件</label><input type="file" id="up-file"></div>
+                <button class="btn btn-primary" onclick="upSend()">&#128229; 上传并计算 SHA-256</button>
+            </div>
+            <div class="preset-row">
+                <span class="hint">原始字节 POST → nginx 缓冲（内存/临时文件）→ C++ <b>file_sha256</b>（线程池卸载）。浏览器端同时用 WebCrypto 计算一份对比，两个哈希应该完全一致。</span>
+            </div>
+            <div class="demo-content">
+                <div class="card">
+                    <h3>结果</h3>
+                    <pre id="up-result" class="log-content" style="min-height:120px;">未上传。</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Tab: Log stats ============ -->
+    <div id="page-logstats" class="tab-page">
+        <div class="panel">
+            <div class="demo-controls">
+                <div class="control-group"><label>行数</label><input type="number" id="ls-lines" value="5000"></div>
+                <button class="btn btn-primary" onclick="lsAnalyze()">&#128200; 分析 access.log</button>
+            </div>
+            <div class="preset-row">
+                <span class="hint">C++ 在 worker pool 上解析 nginx access.log（fgetc 逐行 + 自写日期/状态解析），产出 QPS、状态码分布、TOP URL 和逐秒桶。阻塞 I/O 不卡 worker。</span>
+            </div>
+            <div class="demo-content" style="display:flex;gap:12px;flex-wrap:wrap;">
+                <div class="card" style="flex:1;min-width:280px;"><h3>总览</h3><pre id="ls-overview" class="log-content" style="min-height:120px;">未分析。</pre></div>
+                <div class="card" style="flex:1;min-width:280px;"><h3>TOP URL</h3><pre id="ls-urls" class="log-content" style="min-height:120px;">-</pre></div>
+                <div class="card" style="flex:1;min-width:280px;"><h3>状态码</h3><pre id="ls-status" class="log-content" style="min-height:120px;">-</pre></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Tab: DNS ============ -->
+    <div id="page-dns" class="tab-page">
+        <div class="panel">
+            <div class="demo-controls">
+                <div class="control-group"><label>域名</label><input type="text" id="dns-name" value="myapp.test" class="wide"></div>
+                <div class="control-group"><label>类型</label><select id="dns-type"><option value="1">A</option><option value="28">AAAA</option><option value="5">CNAME</option><option value="16">TXT</option></select></div>
+                <button class="btn btn-primary" onclick="dnsQuery()">&#127760; 查询</button>
+                <button class="btn" onclick="dnsSet('myapp.test')">myapp.test（override）</button>
+                <button class="btn" onclick="dnsSet('www.baidu.com')">www.baidu.com（转发）</button>
+            </div>
+            <div class="preset-row">
+                <span class="hint">自建 DNS-over-UDP 服务器（端口 53，由 C++ 持有监听）：override 表内的名字直接回 A 记录（Lua 拼报文），其余转发 114.114.114.114 并在 C++ LRU 缓存里存 30 秒。</span>
+            </div>
+            <div class="demo-content">
+                <div class="card">
+                    <h3>响应</h3>
+                    <pre id="dns-result" class="log-content" style="min-height:120px;">未查询。</pre>
                 </div>
             </div>
         </div>
@@ -1051,6 +1233,286 @@ async function runFetch() {
     } finally {
         btn.disabled = false;
         btn.innerHTML = '&#128230; 并发抓取';
+    }
+}
+
+// ============================================================
+// UDP (Demo 4)
+// ============================================================
+async function sendUdp() {
+    const btn = event && event.target ? event.target : null;
+    if (btn) { btn.disabled = true; btn.innerHTML = '&#128225; 发送中...'; }
+    const payload = document.getElementById('udp-payload').value;
+    try {
+        const resp = await fetch('/api/udp', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                host: document.getElementById('udp-host').value || '127.0.0.1',
+                port: parseInt(document.getElementById('udp-port').value) || 9000,
+                payload: payload,
+                timeout: parseInt(document.getElementById('udp-timeout').value) || 2000
+            })
+        });
+        const data = await resp.json();
+        if (!data.ok) throw new Error(data.error || 'udp failed');
+
+        const box = document.getElementById('udp-result');
+        if (data.success) {
+            box.innerHTML = '&#9989; 收到回包 (' + data.elapsed_ms.toFixed(1) + ' ms, 墙钟 ' + data.wall_ms + ' ms)\n\n回包内容:\n' +
+                escapeHtml(data.reply || '(空)');
+            box.style.color = 'var(--text-primary)';
+        } else {
+            box.innerHTML = '&#10060; 无回包: ' + escapeHtml(data.info || '(未知错误)') +
+                '\n\n请确认 9000 端口监听正常（新 OpenResty 的 stream UDP），可用 web/udp-probe.ps1 探测。';
+            box.style.color = 'var(--red)';
+        }
+    } catch (err) {
+        const box = document.getElementById('udp-result');
+        box.innerHTML = '&#10060; ' + escapeHtml(err.message);
+        box.style.color = 'var(--red)';
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = '&#128225; 发送 UDP 数据报'; }
+    }
+}
+
+// ============================================================
+// Realtime (WebSocket + syslog)
+// ============================================================
+let rtSocket = null;
+
+function rtConnect() {
+    if (rtSocket && rtSocket.readyState === WebSocket.OPEN) return;
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    rtSocket = new WebSocket(proto + '://' + location.host + '/ws');
+    const status = document.getElementById('rt-status');
+    status.textContent = '连接中...';
+    rtSocket.onopen = function() {
+        status.textContent = '已连接';
+        rtSocket.send('topic:' + document.getElementById('rt-topic').value);
+        document.getElementById('rt-connect-btn').textContent = '\uD83D\uDD0C 已连接';
+    };
+    rtSocket.onmessage = function(ev) {
+        const box = document.getElementById('rt-events');
+        if (box.textContent === '未连接。') box.textContent = '';
+        const line = '[' + new Date().toLocaleTimeString() + '] ' + ev.data + '\n';
+        box.textContent = (box.textContent + line).split('\n').slice(-300).join('\n');
+        box.scrollTop = box.scrollHeight;
+    };
+    rtSocket.onclose = function() {
+        status.textContent = '已断开';
+        document.getElementById('rt-connect-btn').textContent = '\uD83D\uDD0C 连接 WebSocket';
+        rtSocket = null;
+    };
+}
+
+function rtDisconnect() {
+    if (rtSocket) { rtSocket.close(); rtSocket = null; }
+}
+
+function rtClear() {
+    document.getElementById('rt-events').textContent = '未连接。';
+}
+
+async function rtPublishTest() {
+    const resp = await fetch('/api/exec', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({code: 'local i = require("init_ngx_lua_cpp") i:pub("test", "manual-test-" .. tostring(math.random(1000))) return "ok"'})
+    });
+    await resp.json();
+}
+
+async function rtRefreshSyslog() {
+    try {
+        const resp = await fetch('/api/syslog/recent?n=50');
+        const data = await resp.json();
+        if (!data.ok) return;
+        const box = document.getElementById('rt-syslog-list');
+        box.innerHTML = data.entries.length === 0 ? '<span style="color:var(--text-muted);">暂无消息 — 用下面的命令发一条：</span><br><span class="mono" style="font-size:11px;">$c = New-Object System.Net.Sockets.UdpClient; $b = [Text.Encoding]::UTF8.GetBytes(&quot;&lt;134&gt;Aug 17 00:00:01 demo-app hello&quot;); $c.Send($b, $b.Length, &quot;127.0.0.1&quot;, 514) | Out-Null</span>'
+            : data.entries.slice().reverse().map(function(e) {
+                return '<div class="mono" style="font-size:11px;padding:1px 0;border-bottom:1px solid var(--border);">' +
+                    '<span style="color:var(--text-secondary);">' + escapeHtml(e.from) + '</span> ' +
+                    '<span style="color:var(--blue);">' + escapeHtml(e.pri > 0 ? '<' + e.pri + '>' : '') + '</span> ' +
+                    '<span style="color:var(--text-muted);">' + escapeHtml(e.ts || '') + '</span> ' +
+                    escapeHtml(e.msg || e.line) + '</div>';
+            }).join('');
+    } catch (e) {}
+}
+setInterval(rtRefreshSyslog, 2000);
+rtRefreshSyslog();
+
+// ============================================================
+// Gateway (JWT + webhook)
+// ============================================================
+let gwToken = '';
+
+async function gwLogin() {
+    const user = document.getElementById('gw-user').value;
+    const secret = document.getElementById('gw-secret').value;
+    try {
+        const resp = await fetch('/api/auth/login', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({user: user, secret: secret})
+        });
+        const data = await resp.json();
+        if (!data.ok) throw new Error(data.error);
+        gwToken = data.token;
+        document.getElementById('gw-result').textContent =
+            '登录成功，JWT（HS256，C++ hmac_sha256_raw 签名）：\n' + gwToken +
+            '\n\n过期时间: ' + data.expires_in + 's\n';
+    } catch (err) {
+        document.getElementById('gw-result').textContent = '登录失败: ' + err.message;
+    }
+}
+
+async function gwCall(withToken) {
+    const secret = document.getElementById('gw-secret').value;
+    const headers = {};
+    if (withToken) headers.Authorization = 'Bearer ' + gwToken;
+    try {
+        const resp = await fetch('/api/secure/info?secret=' + encodeURIComponent(secret), {headers: headers});
+        const text = await resp.text();
+        document.getElementById('gw-result').textContent =
+            'HTTP ' + resp.status + (withToken ? '（带 Token）' : '（不带 Token）') + '\n' + text;
+    } catch (err) {
+        document.getElementById('gw-result').textContent = '请求失败: ' + err.message;
+    }
+}
+
+async function gwFlood() {
+    const secret = document.getElementById('gw-secret').value;
+    const headers = {Authorization: 'Bearer ' + gwToken};
+    const results = [];
+    for (let i = 0; i < 15; i++) {
+        const resp = await fetch('/api/secure/info?secret=' + encodeURIComponent(secret), {headers: headers});
+        results.push(resp.status);
+    }
+    const counts = {};
+    results.forEach(function(s) { counts[s] = (counts[s] || 0) + 1; });
+    document.getElementById('gw-result').textContent =
+        '15 连发状态码分布（10 req/s + burst 20 → 应有 429 出现）:\n' +
+        Object.keys(counts).map(function(s) { return s + ' × ' + counts[s]; }).join('\n');
+}
+
+async function gwWebhook() {
+    const secret = document.getElementById('gw-secret').value;
+    const body = document.getElementById('gw-wh-payload').value;
+    const box = document.getElementById('gw-webhook-result');
+    try {
+        const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), {name: 'HMAC', hash: 'SHA-256'}, false, ['sign']);
+        const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(body));
+        const hex = Array.from(new Uint8Array(sig)).map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
+        const resp = await fetch('/api/webhook/ingest?secret=' + encodeURIComponent(secret), {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-Ngx-Signature': hex},
+            body: body
+        });
+        const data = await resp.json();
+        box.textContent = '签名(hex): ' + hex.slice(0, 32) + '...\nHTTP ' + resp.status + '\n' + JSON.stringify(data, null, 2);
+        if (data.job_id) {
+            const q = await (await fetch('/api/jobs/query?id=' + data.job_id)).json();
+            box.textContent += '\n任务状态: ' + q.status + ' | 结果: ' + q.result;
+        }
+    } catch (err) {
+        box.textContent = '失败: ' + err.message;
+    }
+}
+
+// ============================================================
+// Cache
+// ============================================================
+async function caSet() {
+    const resp = await fetch('/api/cache/set', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key: document.getElementById('ca-key').value, value: document.getElementById('ca-value').value, ttl: parseInt(document.getElementById('ca-ttl').value) || 60000})
+    });
+    document.getElementById('ca-result').textContent = JSON.stringify(await resp.json(), null, 2);
+}
+
+async function caGet() {
+    const resp = await fetch('/api/cache/get?key=' + encodeURIComponent(document.getElementById('ca-key').value));
+    document.getElementById('ca-result').textContent = JSON.stringify(await resp.json(), null, 2);
+}
+
+async function caStats() {
+    const resp = await fetch('/api/cache/stats');
+    document.getElementById('ca-result').textContent = JSON.stringify(await resp.json(), null, 2);
+}
+
+async function caCompute() {
+    const resp = await fetch('/api/cache/compute');
+    document.getElementById('ca-result').textContent = JSON.stringify(await resp.json(), null, 2);
+}
+
+// ============================================================
+// Upload
+// ============================================================
+async function upSend() {
+    const file = document.getElementById('up-file').files[0];
+    const box = document.getElementById('up-result');
+    if (!file) { box.textContent = '请先选择文件'; return; }
+    try {
+        const resp = await fetch('/api/upload?name=' + encodeURIComponent(file.name), {
+            method: 'POST',
+            headers: {'Content-Type': 'application/octet-stream'},
+            body: file
+        });
+        const data = await resp.json();
+        let text = '服务器（C++）: ' + data.sha256 + '\n大小: ' + data.size + ' bytes, 耗时: ' + data.elapsed_ms + 'ms\n';
+        // client-side comparison
+        const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+        const hex = Array.from(new Uint8Array(digest)).map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
+        text += '浏览器 (WebCrypto): ' + hex + '\n\n' + (hex === data.sha256 ? '✅ 两侧哈希一致！' : '❌ 不一致！');
+        box.textContent = text;
+    } catch (err) {
+        box.textContent = '上传失败: ' + err.message;
+    }
+}
+
+// ============================================================
+// Log stats
+// ============================================================
+async function lsAnalyze() {
+    const lines = parseInt(document.getElementById('ls-lines').value) || 5000;
+    try {
+        const resp = await fetch('/api/stats/access?lines=' + lines);
+        const d = await resp.json();
+        const s = d.stats;
+        document.getElementById('ls-overview').textContent =
+            '行数: ' + s.lines + '\n请求: ' + s.total + '\nQPS: ' + s.qps.toFixed(3) +
+            '\n跨度: ' + Math.round(s.span_seconds) + 's\n解析耗时: ' + s.elapsed_ms + 'ms' +
+            '\n状态: 2xx=' + s.status_2xx + ' 3xx=' + s.status_3xx + ' 4xx=' + s.status_4xx + ' 5xx=' + s.status_5xx;
+        document.getElementById('ls-urls').textContent = d.top_urls.map(function(u, i) {
+            return (i + 1) + '. ' + u[0] + '  ×' + u[1];
+        }).join('\n') || '-';
+        document.getElementById('ls-status').textContent = d.statuses.map(function(st) {
+            return st[0] + ': ' + st[1];
+        }).join('\n') || '-';
+    } catch (err) {
+        document.getElementById('ls-overview').textContent = '分析失败: ' + err.message;
+    }
+}
+
+// ============================================================
+// DNS
+// ============================================================
+function dnsSet(name) { document.getElementById('dns-name').value = name; }
+
+async function dnsQuery() {
+    const name = document.getElementById('dns-name').value;
+    const type = document.getElementById('dns-type').value;
+    try {
+        const resp = await fetch('/api/dns/query?name=' + encodeURIComponent(name) + '&type=' + type);
+        const d = await resp.json();
+        document.getElementById('dns-result').textContent = d.ok ?
+            '查询: ' + name + ' (type ' + type + ')\n' +
+            '应答数: ' + d.ancount + '\n' +
+            'A 记录: ' + (d.answer_ip || '(无)') + '\n' +
+            '响应长度: ' + d.response_len + ' bytes\n' +
+            '耗时: ' + d.elapsed_ms + 'ms (墙钟 ' + d.wall_ms + 'ms)' :
+            '查询失败: ' + d.error;
+    } catch (err) {
+        document.getElementById('dns-result').textContent = '请求失败: ' + err.message;
     }
 }
 
