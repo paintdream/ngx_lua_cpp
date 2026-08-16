@@ -9,16 +9,33 @@ Usage:
   powershell -ExecutionPolicy Bypass -File web/run-server.ps1             # start (or restart)
   powershell -ExecutionPolicy Bypass -File web/run-server.ps1 -Stop       # stop
   powershell -ExecutionPolicy Bypass -File web/run-server.ps1 -Restart    # stop, sync, start
+  powershell -ExecutionPolicy Bypass -File web/run-server.ps1 -TestUdp    # also run the UDP smoke test
   powershell -ExecutionPolicy Bypass -File web/run-server.ps1 -NginxExe C:\path\to\nginx.exe
 
 The script copies web/nginx.conf and web/index.html into web/run (mime.types
 is copied from the nginx install on first run), then starts
 `nginx.exe -p web/run -c conf/nginx.conf` and probes http://localhost:8080/api/info.
+
+The default nginx is the official 64-bit OpenResty 1.27.1.2 installed next to
+WinNMP (C:\Tools\OpenResty\openresty-1.27.1.2-win64). Note that UDP listeners
+cannot be declared in nginx.conf on Windows at all -- nginx compiles
+"listen ... udp" out on Windows (#if !(NGX_WIN32) in ngx_stream_core_module.c)
+-- so the demo's UDP servers (ports 9000/9001) are owned by the ngx_lua_cpp
+C++ instance (udp_listen/udp_recv/udp_send, see demo/udp_echo_server.lua).
+Build the library for x64 to match this binary:
+
+  cmake -S . -B build64 -A x64 -DLUA_LIBRARY=C:\Tools\OpenResty\openresty-1.27.1.2-win64\lua51.lib
+  cmake --build build64 --config Debug
+  (web/make-lua51-lib.ps1 generates lua51.lib from the shipped lua51.dll if missing)
+
+Stop only touches nginx processes started with this prefix, so unrelated
+nginx servers (including WinNMP's) are never killed.
 #>
 param(
     [switch]$Stop,
     [switch]$Restart,
-    [string]$NginxExe = "C:\Tools\WinNMP\bin\nginx-1.7.7\nginx.exe"
+    [switch]$TestUdp,
+    [string]$NginxExe = "C:\Tools\OpenResty\openresty-1.27.1.2-win64\nginx.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,10 +47,31 @@ $repo = Split-Path -Parent $MyInvocation.MyCommand.Path   # this script's dir = 
 $run  = Join-Path $repo "run"
 $pidFile = Join-Path $run "logs/nginx.pid"
 
+# nginx processes belonging to THIS prefix (command line contains "-p <run dir>");
+# never touch unrelated nginx servers (e.g. WinNMP's own).
+function Get-OwnNginxPids {
+    try {
+        $runKey = ($run -replace '/', '\').ToLowerInvariant()
+        $pids = Get-CimInstance Win32_Process -Filter "Name='nginx.exe'" -ErrorAction Stop |
+            Where-Object { $_.CommandLine -and (($_.CommandLine -replace '/', '\').ToLowerInvariant() -like "*$runKey*") } |
+            Select-Object -ExpandProperty ProcessId
+        return @($pids)
+    } catch {
+        # CIM unavailable: fall back to the pid file, then to name matching
+        if (Test-Path $pidFile) {
+            $p = Get-Content $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($p -and $p -match '^\d+$') { return @([int]$p) }
+        }
+        $all = @(Get-Process -Name "nginx" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+        return $all
+    }
+}
+
 # ---------------------------------------------------------------- stop
 if ($Stop -or $Restart) {
-    if (Get-Process -Name "nginx" -ErrorAction SilentlyContinue) {
-        Write-Host "Stopping nginx..."
+    $pids = Get-OwnNginxPids
+    if ($pids.Count -gt 0) {
+        Write-Host "Stopping nginx (pid $($pids -join ', '))..."
         # a stale pid file (crash / manual kill / test artifact) makes -s stop
         # fail; never abort on that, fall through to the force-kill below.
         # (PS 5.1 turns native stderr into terminating errors under
@@ -48,11 +86,12 @@ if ($Stop -or $Restart) {
             $deadline = (Get-Date).AddSeconds(10)
             while ((Get-Date) -lt $deadline) {
                 Start-Sleep -Milliseconds 500
-                if (-not (Get-Process -Name "nginx" -ErrorAction SilentlyContinue)) { break }
+                if ((Get-OwnNginxPids).Count -eq 0) { break }
             }
         }
-        if (Get-Process -Name "nginx" -ErrorAction SilentlyContinue) {
-            Stop-Process -Name "nginx" -Force
+        $still = Get-OwnNginxPids
+        if ($still.Count -gt 0) {
+            Stop-Process -Id $still -Force -ErrorAction SilentlyContinue
             Write-Host "nginx force-stopped."
         } else {
             Write-Host "nginx stopped."
@@ -63,7 +102,7 @@ if ($Stop -or $Restart) {
 }
 
 # ---------------------------------------------------------------- sync files
-New-Item -ItemType Directory -Force -Path (Join-Path $run "conf"), (Join-Path $run "logs"), (Join-Path $run "html") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $run "conf"), (Join-Path $run "logs"), (Join-Path $run "html"), (Join-Path $run "upload_tmp") | Out-Null
 Copy-Item (Join-Path $repo "nginx.conf") (Join-Path $run "conf/nginx.conf") -Force
 Copy-Item (Join-Path $repo "index.html") (Join-Path $run "html/index.html") -Force
 
@@ -78,8 +117,8 @@ if (-not (Test-Path $mime)) {
 }
 
 # ---------------------------------------------------------------- start
-if (Get-Process -Name "nginx" -ErrorAction SilentlyContinue) {
-    Write-Host "nginx already running - use -Restart to restart it"
+if ((Get-OwnNginxPids).Count -gt 0) {
+    Write-Host "nginx already running for this prefix - use -Restart to restart it"
 } else {
     Write-Host "Starting nginx (prefix: $run)..."
     Start-Process -FilePath $NginxExe -ArgumentList "-p", $run, "-c", "conf/nginx.conf" `
@@ -94,4 +133,10 @@ try {
 } catch {
     Write-Host "nginx started but /api/info is not reachable yet: $($_.Exception.Message)"
     Write-Host "Check the error log: $run/logs/error.log"
+}
+
+# ---------------------------------------------------------------- udp test
+if ($TestUdp) {
+    Write-Host "Probing UDP listeners (9000 = ngx_lua_cpp echo, 9001 = plain Lua)..."
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $repo "udp-probe.ps1") -All
 }
