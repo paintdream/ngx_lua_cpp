@@ -148,6 +148,19 @@ upload hasher, log analysis, DNS and a log viewer.
 > otherwise. The config prefers the **Release** library: the Debug build's
 > `IRIS_ASSERT` (plain `assert()`) can pop blocking message boxes on the
 > desktop when an internal invariant trips, which stalls the event loop.
+>
+> **Running on the old WinNMP OpenResty.** The TCP/HTTP demos keep working on
+> the legacy 32-bit OpenResty (WinNMP's `nginx.exe`, openresty 1.15.8.3):
+> `demo/init_ngx_lua_cpp.lua` locates the native library with
+> `package.loadlib` ordered by process bitness (plain `require` would abort
+> on the first wrong-architecture DLL), so the 32-bit build
+> (`cmake -S . -B build -A Win32` + `--config Release`) is picked
+> automatically. And because the datagram listeners live in the C++ layer,
+> the UDP demos run there too — start it with
+> `run-server.ps1 -NginxExe C:\Tools\WinNMP\bin\nginx-1.7.7\nginx.exe`.
+> If no DLL at all is available for the platform, the demo center still
+> serves the pure-HTTP endpoints (the UDP services are skipped with a
+> warning).
 
 > **UDP support (Demo 4/5)** works on any platform: nginx compiles
 > `listen ... udp` out on Windows (`#if !(NGX_WIN32)` in
