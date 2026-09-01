@@ -61,6 +61,14 @@ extern "C" {
 #define lua_newuserdatauv(L, size, uv) lua_newuserdata(L, size)
 #endif
 
+#ifndef IRIS_LUA_ENABLE_YIELDK
+#if LUA_VERSION_NUM >= 503
+#define IRIS_LUA_ENABLE_YIELDK 1
+#else
+#define IRIS_LUA_ENABLE_YIELDK 0
+#endif
+#endif
+
 #ifndef IRIS_LUA_LOGERROR
 #define IRIS_LUA_LOGERROR(...) std::invoke(fprintf, stderr, __VA_ARGS__)
 #endif
@@ -2212,8 +2220,18 @@ namespace iris {
 			}
 		}
 
+		// A registered (lua_registar) type is a reference-managed object, so it can never
+		// be materialised by value through the default lua_fromstack. Resolve it according to
+		// how the C++ parameter was declared so that every form binds cleanly:
+		//   - by value / const by value  (type_t value / const type_t value)  -> moved by value
+		//   - rvalue ref                 (type_t&& value / const type_t&&)     -> moved by value (take)
+		//   - lvalue ref / const ref     (type_t& / const type_t& value)      -> lvalue reference
+		// Non-registrar types keep their existing by-value conversion (e.g. const int& -> int).
 		template <typename type_t>
-		using cast_arg_type_t = std::conditional_t<has_lua_registar<remove_cvref_t<type_t>>::value && !std::is_const_v<std::remove_reference_t<type_t>>, remove_cvref_t<type_t>&, remove_cvref_t<type_t>>;
+		using cast_arg_type_t = std::conditional_t<
+			has_lua_registar<remove_cvref_t<type_t>>::value && !std::is_const_v<std::remove_reference_t<type_t>>,
+			std::conditional_t<std::is_lvalue_reference_v<type_t>, remove_cvref_t<type_t>&, remove_cvref_t<type_t>>,
+			remove_cvref_t<type_t>>;
 		
 		// wrap a member function with normal function
 		template <auto method, typename return_t, typename type_t, typename... args_t>
@@ -2924,6 +2942,11 @@ namespace iris {
 				// returning existing reference from internal storage
 				// must check before calling this
 				return *get_variable<std::remove_reference_t<type_t>*>(L, index);
+			} else if constexpr (has_lua_registar<value_t>::value) {
+				// registered types are reference-managed objects with no lua_fromstack;
+				// when one is requested by value, move it out of the referenced object so
+				// that only a move constructor is required (not a copy constructor)
+				return std::move(*get_variable<value_t*>(L, index));
 			} else {
 				// by default, force iris_lua_traits_t
 				return iris_lua_traits_t<value_t>::type::lua_fromstack(iris_lua_t(L), index);
@@ -3191,7 +3214,7 @@ namespace iris {
 								push_variable(L, std::move(value.value()));
 							} else {
 								// error!
-#if LUA_ENABLE_YIELDK
+#if IRIS_LUA_ENABLE_YIELDK
 								push_variable(L, std::move(value.message));
 								context = reinterpret_cast<char*>(L) + 1;
 #else
@@ -3274,7 +3297,7 @@ namespace iris {
 			coroutine_cleanup(L, address);
 		}
 
-#if LUA_ENABLE_YIELDK
+#if IRIS_LUA_ENABLE_YIELDK
 		static int function_coroutine_continuation(lua_State* L, int status, lua_KContext context) {
 			IRIS_ASSERT(status == LUA_YIELD);
 			// detect error
@@ -3328,7 +3351,7 @@ namespace iris {
 					return lua_error(L);
 				} else {
 					// coroutine_state_yield
-#if LUA_ENABLE_YIELDK
+#if IRIS_LUA_ENABLE_YIELDK
 					// after Lua 5.3, we can throw errors on C-coroutine via lua_yieldk directly
 					// so it can be captured within current pcall() context
 					return IRIS_LUA_YIELDK(L, 0, lua_gettop(L), &iris_lua_t::function_coroutine_continuation);
