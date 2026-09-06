@@ -32,6 +32,7 @@ SOFTWARE.
 #include "iris_common.h"
 #include <array>
 #include <optional>
+#include <queue>
 
 extern "C" {
 #if !USE_LUA_LIBRARY
@@ -50,11 +51,20 @@ extern "C" {
 #error "Unsupported lua version!"
 #endif
 
+// LUA_OK redefinition is benign on LuaJIT (identical replacement list);
+// lua_rawlen / lua_absindex / LUA_NUMTYPES do not exist in LuaJIT either,
+// so these shims must stay enabled for it
 #if LUA_VERSION_NUM <= 501
 #define LUA_OK 0
 #define lua_rawlen lua_objlen
 #define lua_absindex(L, index) ((index > 0) || (index <= LUA_REGISTRYINDEX) ? (index) : (lua_gettop(L) + 1 + index))
 #define LUA_NUMTYPES (LUA_TTHREAD + 1)
+#endif
+
+// vanilla lua 5.1 lacks luaL_loadbufferx (a 5.2+ api); LuaJIT provides it
+// natively even at LUA_VERSION_NUM 501, so the shim only applies to non-LuaJIT
+#if LUA_VERSION_NUM <= 501 && !defined(LUAJIT_VERSION)
+#define luaL_loadbufferx(L, b, s, n, m) luaL_loadbuffer(L, b, s, n)
 #endif
 
 #if LUA_VERSION_NUM <= 503
@@ -100,7 +110,49 @@ namespace iris {
 	};
 
 	// A simple lua binding with C++17
+	template <typename container_type>
+	struct proxy_view_t; // forward declaration: members of iris_lua_t reference it
+
+	// ---- container face detection (structured ducktyping, mirrors iris_is_map) ----
+	// queue face: FIFO/LIFO structures without random access (std::queue, iris_queue_list_t):
+	// value_type + size() + empty() + front() + push(v) + pop()
+	template <typename type_t, typename = void>
+	struct iris_is_queue : std::false_type {};
+
+	template <typename type_t>
+	struct iris_is_queue<type_t, iris_void_t<
+		typename type_t::value_type,
+		decltype(std::declval<type_t>().size()),
+		decltype(std::declval<type_t>().empty()),
+		decltype(std::declval<type_t>().front()),
+		decltype(std::declval<type_t>().push(std::declval<typename type_t::value_type>())),
+		decltype(std::declval<type_t>().pop())
+	>> : std::true_type {};
+
+	// heap face: priority queues (std::priority_queue): value_type + size() + empty() + top() + push(v) + pop()
+	template <typename type_t, typename = void>
+	struct iris_is_heap : std::false_type {};
+
+	template <typename type_t>
+	struct iris_is_heap<type_t, iris_void_t<
+		typename type_t::value_type,
+		decltype(std::declval<type_t>().size()),
+		decltype(std::declval<type_t>().empty()),
+		decltype(std::declval<type_t>().top()),
+		decltype(std::declval<type_t>().push(std::declval<typename type_t::value_type>())),
+		decltype(std::declval<type_t>().pop())
+	>> : std::true_type {};
+
+	// optional back() probe for the queue face (std::queue has it, iris_queue_list_t does not)
+	template <typename type_t, typename = void>
+	struct iris_is_backable : std::false_type {};
+
+	template <typename type_t>
+	struct iris_is_backable<type_t, iris_void_t<decltype(std::declval<type_t>().back())>> : std::true_type {};
+
 	struct iris_lua_t : enable_read_write_fence_t<> {
+		template <typename container_type>
+		friend struct proxy_view_t; // proxy internals need push/get/check access
 		static constexpr size_t size_mask_view = 1u;
 		static constexpr size_t size_mask_alignment = 2u;
 		static constexpr size_t state_mask_reflection = 1u;
@@ -1518,6 +1570,120 @@ namespace iris {
 			}
 		}
 
+		// set 'current' lua table, binding a member container as an in-place proxy view:
+		// lua code gets a.vector[i] = 5 forwarded to the container embedded in the owner,
+		// instead of reading the whole container out and writing it back.
+		// only accepts member object pointers; const members get a read-only proxy (no __set).
+		// proxy methods are only reachable through the metatable (getmetatable(p).push_back(p, v)),
+		// so data keys are never shadowed. whole-container assignment (a.vector = proxy_or_table)
+		// is supported through __set.
+		template <auto ptr, typename type_t = void, typename key_t, typename... envs_t>
+		reflection_t set_current_proxy(key_t&& key, envs_t&&... envs) {
+			static_assert(std::is_member_object_pointer_v<decltype(ptr)>, "set_current_proxy only accepts member object pointers.");
+
+			auto guard = write_fence();
+
+			lua_State* L = state;
+			stack_guard_t stack_guard(L);
+
+			check_matched_class_type<ptr, type_t>(L);
+
+			lua_pushliteral(L, "__get");
+			lua_rawget(L, -2);
+			IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+			push_variable(L, std::forward<key_t>(key));
+			lua_pushcclosure(L, &iris_lua_t::property_proxy_get_proxy<ptr, type_t>, 0);
+			lua_rawset(L, -3);
+			lua_pop(L, 1);
+
+			if constexpr (std::is_const_v<typename member_object_traits_t<decltype(ptr)>::value>) {
+				// const members are read-only proxies, no __set entry
+			} else if constexpr (!std::is_copy_assignable_v<std::remove_const_t<typename member_object_traits_t<decltype(ptr)>::value>>) {
+				// move-only containers (e.g. iris_queue_list_t) cannot take the whole-container
+				// copy assignment in property_proxy_set_proxy, no __set entry either
+			} else {
+				lua_pushliteral(L, "__set");
+				lua_rawget(L, -2);
+				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+				push_variable(L, std::forward<key_t>(key));
+				lua_pushcclosure(L, &iris_lua_t::property_proxy_set_proxy<ptr, type_t>, 0);
+				lua_rawset(L, -3);
+				lua_pop(L, 1);
+			}
+
+			return nullptr;
+		}
+
+		// set 'current' lua table, binding a computed property to custom getter/setter
+		// functions: lua reads a.x -> getter(object), writes a.x = v -> setter(object, v).
+		// getter and setter are member function pointers, or free function pointers whose
+		// first parameter is the owner. pass only a getter (or nullptr as the setter) for
+		// a read-only property.
+		template <auto getter, auto setter = nullptr, typename type_t = void, typename key_t, typename... envs_t>
+		reflection_t set_current_prop(key_t&& key, envs_t&&... envs) {
+			static_assert(std::is_member_function_pointer_v<decltype(getter)> || (std::is_pointer_v<decltype(getter)> && std::is_function_v<std::remove_pointer_t<decltype(getter)>>), "A property getter must be a member or free function pointer.");
+
+			auto guard = write_fence();
+
+			lua_State* L = state;
+			stack_guard_t stack_guard(L);
+
+			check_matched_class_type<getter, type_t>(L);
+
+			lua_pushliteral(L, "__get");
+			lua_rawget(L, -2);
+			IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+			push_variable(L, std::forward<key_t>(key));
+			lua_pushcclosure(L, &iris_lua_t::property_custom_get_proxy<getter, type_t>, 0);
+			lua_rawset(L, -3);
+			lua_pop(L, 1);
+
+			if constexpr (setter != nullptr) {
+				static_assert(std::is_member_function_pointer_v<decltype(setter)> || (std::is_pointer_v<decltype(setter)> && std::is_function_v<std::remove_pointer_t<decltype(setter)>>), "A property setter must be a member or free function pointer.");
+
+				check_matched_class_type<setter, type_t>(L);
+
+				lua_pushliteral(L, "__set");
+				lua_rawget(L, -2);
+				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+				push_variable(L, key);
+				lua_pushcclosure(L, &iris_lua_t::property_custom_set_proxy<setter, type_t>, 0);
+				lua_rawset(L, -3);
+				lua_pop(L, 1);
+			} else {
+				// read-only: register an erroring __set so assignments fail loudly
+				// instead of silently no-opping (matches const member properties)
+				lua_pushliteral(L, "__set");
+				lua_rawget(L, -2);
+				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+				push_variable(L, key);
+				lua_pushcclosure(L, &iris_lua_t::property_readonly_set_proxy, 0);
+				lua_rawset(L, -3);
+				lua_pop(L, 1);
+			}
+
+			return nullptr;
+		}
+
+		// functor form of set_current_prop, mirroring set_current(key, functor):
+		// stateful getters/setters are stored in gc-managed userdata referenced
+		// as closure upvalues. the functor's first parameter is the owner (T* or T&),
+		// setters take exactly one additional value parameter.
+		template <typename key_t, typename getter_t>
+		reflection_t set_current_prop(key_t&& key, getter_t&& getter) {
+			return set_current_prop_functor_internal(std::forward<key_t>(key), std::forward<getter_t>(getter));
+		}
+
+		template <typename key_t, typename getter_t, typename setter_t>
+		reflection_t set_current_prop(key_t&& key, getter_t&& getter, setter_t&& setter) {
+			return set_current_prop_functor_internal(std::forward<key_t>(key), std::forward<getter_t>(getter), std::forward<setter_t>(setter));
+		}
+
 		template <auto ptr, typename key_t, typename... envs_t>
 		reflection_t set_current_new(key_t&& key, envs_t&&... envs) {
 			return set_current_new_internal<ptr>(ptr, std::forward<key_t>(key), std::forward<envs_t>(envs)...);
@@ -1823,6 +1989,70 @@ namespace iris {
 		}
 
 	protected:
+		template <typename key_t, typename getter_t, typename... setter_t>
+		reflection_t set_current_prop_functor_internal(key_t&& key, getter_t&& getter, setter_t&&... setter) {
+			using getter_value_t = remove_cvref_t<getter_t>;
+			static_assert(is_functor<getter_value_t>::value, "A property getter must be a functor with operator ().");
+			static_assert(std::is_class_v<getter_value_t>, "Use the set_current_prop<&getter, &setter>(name) form for plain function pointers.");
+
+			using getter_traits_t = functor_property_traits_t<decltype(&getter_value_t::operator ())>;
+			static_assert(getter_traits_t::arg_count == 1, "A property getter functor must take the owner as its only parameter.");
+			static_assert(!std::is_void_v<typename getter_traits_t::result>, "A property getter must not return void.");
+
+			using owner_t = functor_property_owner_t<getter_value_t>;
+			static_assert(std::is_class_v<owner_t>, "The first parameter of a property functor must be a pointer or reference to the owner class.");
+
+			if constexpr (sizeof...(setter_t) != 0) {
+				using setter_value_t = remove_cvref_t<std::tuple_element_t<0, std::tuple<setter_t...>>>;
+				static_assert(sizeof...(setter_t) == 1, "Only one setter functor is allowed.");
+				static_assert(is_functor<setter_value_t>::value, "A property setter must be a functor with operator ().");
+
+				using setter_traits_t = functor_property_traits_t<decltype(&setter_value_t::operator ())>;
+				static_assert(setter_traits_t::arg_count == 2, "A property setter functor must take the owner and exactly one value parameter.");
+				static_assert(std::is_same_v<std::remove_cv_t<functor_property_owner_t<setter_value_t>>, std::remove_cv_t<owner_t>>, "Getter and setter functors must share the same owner type.");
+			}
+
+			auto guard = write_fence();
+
+			lua_State* L = state;
+			stack_guard_t stack_guard(L);
+
+			// __get entry: closure holding the getter functor as upvalue
+			lua_pushliteral(L, "__get");
+			lua_rawget(L, -2);
+			IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+			push_variable(L, std::forward<key_t>(key));
+			push_property_functor(L, std::forward<getter_t>(getter));
+			lua_pushcclosure(L, &iris_lua_t::property_functor_get_proxy<owner_t, getter_value_t>, 1);
+			lua_rawset(L, -3);
+			lua_pop(L, 1);
+
+			if constexpr (sizeof...(setter_t) != 0) {
+				lua_pushliteral(L, "__set");
+				lua_rawget(L, -2);
+				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+				push_variable(L, key);
+				push_property_functor(L, std::forward<setter_t>(setter)...);
+				using setter_value_t = remove_cvref_t<std::tuple_element_t<0, std::tuple<setter_t...>>>;
+				lua_pushcclosure(L, &iris_lua_t::property_functor_set_proxy<functor_property_owner_t<setter_value_t>, setter_value_t>, 1);
+				lua_rawset(L, -3);
+				lua_pop(L, 1);
+			} else {
+				lua_pushliteral(L, "__set");
+				lua_rawget(L, -2);
+				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+				push_variable(L, key);
+				lua_pushcclosure(L, &iris_lua_t::property_readonly_set_proxy, 0);
+				lua_rawset(L, -3);
+				lua_pop(L, 1);
+			}
+
+			return nullptr;
+		}
+
 		template <auto ptr, typename return_t, typename key_t, typename type_t, typename... args_t, typename... envs_t>
 		reflection_t set_current_new_internal(return_t (*)(iris_lua_t, type_t*, args_t...), key_t&& key, envs_t&&... envs) {
 			auto guard = write_fence();
@@ -2463,7 +2693,7 @@ namespace iris {
 
 			if constexpr (!std::is_trivially_destructible_v<object_t>) {
 				lua_newtable(L);
-				make_uniform_meta_internal<type_t, 0>(L);
+				make_uniform_meta_internal<type_t>(L);
 				lua_setmetatable(L, -2);
 			}
 
@@ -3425,8 +3655,7 @@ namespace iris {
 			using value_t = decltype(object->*prop);
 			stack_guard_t guard(L, 1);
 			push_variable(L, object->*prop); // return the property value
-			return 1;
-		}
+			return 1;		}
 
 		template <auto prop, typename type_t>
 		static int property_get_proxy(lua_State* L) {
@@ -3453,6 +3682,327 @@ namespace iris {
 		template <auto prop, typename type_t>
 		static int property_set_proxy(lua_State* L) {
 			return property_set_proxy_dispatch<decltype(prop), type_t>(L, prop);
+		}
+
+		// decompose a getter/setter callable (member function pointer or a free
+		// function pointer taking the owner as its first parameter) used by
+		// set_current_prop, following the four [const][noexcept] member specs
+		template <typename ptr_t>
+		struct member_callable_traits_t;
+
+		template <typename return_t, typename class_t, typename... args_t>
+		struct member_callable_traits_t<return_t (class_t::*)(args_t...)> {
+			using owner = class_t;
+			using result = return_t;
+			using args_tuple = std::tuple<args_t...>;
+			static constexpr size_t arg_count = sizeof...(args_t);
+		};
+
+		template <typename return_t, typename class_t, typename... args_t>
+		struct member_callable_traits_t<return_t (class_t::*)(args_t...) noexcept> : member_callable_traits_t<return_t (class_t::*)(args_t...)> {};
+
+		template <typename return_t, typename class_t, typename... args_t>
+		struct member_callable_traits_t<return_t (class_t::*)(args_t...) const> : member_callable_traits_t<return_t (class_t::*)(args_t...)> {};
+
+		template <typename return_t, typename class_t, typename... args_t>
+		struct member_callable_traits_t<return_t (class_t::*)(args_t...) const noexcept> : member_callable_traits_t<return_t (class_t::*)(args_t...)> {};
+
+		template <typename return_t, typename first_t, typename... args_t>
+		struct member_callable_traits_t<return_t (*)(first_t, args_t...)> {
+			using owner = std::remove_pointer_t<first_t>;
+			using result = return_t;
+			using args_tuple = std::tuple<args_t...>;
+			static constexpr size_t arg_count = sizeof...(args_t);
+		};
+
+		// __get entry generated by set_current_prop: calls a custom getter
+		template <auto getter, typename subtype_t>
+		static int property_custom_get_proxy(lua_State* L) {
+			using traits_t = member_callable_traits_t<decltype(getter)>;
+			using owner_t = std::conditional_t<std::is_void_v<subtype_t>, typename traits_t::owner, subtype_t>;
+			static_assert(!std::is_void_v<typename traits_t::result>, "A property getter must not return void.");
+			static_assert(traits_t::arg_count == 0, "A property getter must take no arguments besides the owner.");
+
+			owner_t* object = get_variable<owner_t*>(L, 1);
+			if (object == nullptr) {
+				return syserror(L, "error.parameter", "The first parameter of a property must be a C++ instance of type %s.\n", get_lua_name<owner_t>());
+			}
+
+			stack_guard_t guard(L, 1);
+			if constexpr (std::is_member_function_pointer_v<decltype(getter)>) {
+				push_variable(L, (object->*getter)());
+			} else {
+				push_variable(L, getter(object));
+			}
+
+			return 1;
+		}
+
+		// __set entry for getter-only properties: report an error instead of
+		// letting the assignment silently no-op (matches the const member behavior)
+		static int property_readonly_set_proxy(lua_State* L) {
+			return syserror(L, "error.exec", "Cannot modify a read-only property.\n");
+		}
+
+		// decompose a getter/setter functor signature: the first parameter is the
+		// owner (T* or T&), setters take exactly one additional value parameter
+		template <typename functor_t>
+		struct functor_property_traits_t;
+
+		template <typename functor_t, typename return_t, typename... args_t>
+		struct functor_property_traits_t<return_t (functor_t::*)(args_t...)> {
+			using result = return_t;
+			using args_tuple = std::tuple<args_t...>;
+			static constexpr size_t arg_count = sizeof...(args_t);
+			static constexpr bool is_const = false;
+		};
+
+		template <typename functor_t, typename return_t, typename... args_t>
+		struct functor_property_traits_t<return_t (functor_t::*)(args_t...) const> {
+			using result = return_t;
+			using args_tuple = std::tuple<args_t...>;
+			static constexpr size_t arg_count = sizeof...(args_t);
+			static constexpr bool is_const = true;
+		};
+
+		template <typename functor_t>
+		using functor_property_owner_t = std::conditional_t<
+			std::is_pointer_v<std::tuple_element_t<0, typename functor_property_traits_t<decltype(&functor_t::operator ())>::args_tuple>>,
+			std::remove_pointer_t<std::tuple_element_t<0, typename functor_property_traits_t<decltype(&functor_t::operator ())>::args_tuple>>,
+			std::remove_reference_t<std::tuple_element_t<0, typename functor_property_traits_t<decltype(&functor_t::operator ())>::args_tuple>>>;
+
+		// create a userdata holding a moved/copyed functor with __gc if needed,
+		// mirroring push_functor_internal's storage (used as closure upvalue)
+		template <typename functor_t>
+		static void push_property_functor(lua_State* L, functor_t&& functor) {
+			using value_t = remove_cvref_t<functor_t>;
+			void* userdata = lua_newuserdatauv(L, iris_to_alignment(sizeof(value_t), size_mask_alignment), 0);
+			if constexpr (std::is_rvalue_reference_v<functor_t&&>) {
+				new (userdata) value_t(std::move(functor));
+			} else {
+				new (userdata) value_t(functor);
+			}
+
+			if constexpr (!std::is_trivially_destructible_v<value_t>) {
+				lua_newtable(L);
+				make_uniform_meta_internal<value_t>(L);
+				lua_setmetatable(L, -2);
+			}
+		}
+
+		// __get entry for functor getters: upvalue 1 holds the functor userdata
+		template <typename owner_t, typename getter_t>
+		static int property_functor_get_proxy(lua_State* L) {
+			getter_t* functor = reinterpret_cast<getter_t*>(lua_touserdata(L, lua_upvalueindex(1)));
+			IRIS_ASSERT(functor != nullptr);
+
+			owner_t* object = get_variable<owner_t*>(L, 1);
+			if (object == nullptr) {
+				return syserror(L, "error.parameter", "The first parameter of a property must be a C++ instance of type %s.\n", get_lua_name<owner_t>());
+			}
+
+			using first_t = std::tuple_element_t<0, typename functor_property_traits_t<decltype(&getter_t::operator ())>::args_tuple>;
+			stack_guard_t guard(L, 1);
+			if constexpr (std::is_pointer_v<first_t>) {
+				push_variable(L, (*functor)(object));
+			} else {
+				push_variable(L, (*functor)(*object));
+			}
+
+			return 1;
+		}
+
+		// __set entry for functor setters: upvalue 1 holds the functor userdata,
+		// value is read from stack index 3 (index 2 holds the key)
+		template <typename owner_t, typename setter_t>
+		static int property_functor_set_proxy(lua_State* L) {
+			setter_t* functor = reinterpret_cast<setter_t*>(lua_touserdata(L, lua_upvalueindex(1)));
+			IRIS_ASSERT(functor != nullptr);
+
+			owner_t* object = get_variable<owner_t*>(L, 1);
+			if (object == nullptr) {
+				return syserror(L, "error.parameter", "The first parameter of a property must be a C++ instance of type %s.\n", get_lua_name<owner_t>());
+			}
+
+			using traits_t = functor_property_traits_t<decltype(&setter_t::operator ())>;
+			using first_t = std::tuple_element_t<0, typename traits_t::args_tuple>;
+			using value_t = remove_cvref_t<std::tuple_element_t<1, typename traits_t::args_tuple>>;
+
+			if (!check_required_parameters<value_t>(L, 0, 0, false, 3, true)) {
+				return syserror(L, "error.parameter", "Invalid value for property of type %s.\n", get_lua_name<value_t>());
+			}
+
+			if constexpr (std::is_pointer_v<first_t>) {
+				(*functor)(object, get_variable<value_t>(L, 3));
+			} else {
+				(*functor)(*object, get_variable<value_t>(L, 3));
+			}
+
+			return 0;
+		}
+
+		// __set entry generated by set_current_prop: calls a custom setter with
+		// the value at stack index 3 (index 2 holds the key, as in property_set_proxy)
+		template <auto setter, typename subtype_t>
+		static int property_custom_set_proxy(lua_State* L) {
+			using traits_t = member_callable_traits_t<decltype(setter)>;
+			using owner_t = std::conditional_t<std::is_void_v<subtype_t>, typename traits_t::owner, subtype_t>;
+			static_assert(traits_t::arg_count == 1, "A property setter must take exactly one value argument besides the owner.");
+			using value_t = remove_cvref_t<std::tuple_element_t<0, typename traits_t::args_tuple>>;
+
+			owner_t* object = get_variable<owner_t*>(L, 1);
+			if (object == nullptr) {
+				return syserror(L, "error.parameter", "The first parameter of a property must be a C++ instance of type %s.\n", get_lua_name<owner_t>());
+			}
+
+			if (!check_required_parameters<value_t>(L, 0, 0, false, 3, true)) {
+				return syserror(L, "error.parameter", "Invalid value for property of type %s.\n", get_lua_name<value_t>());
+			}
+
+			if constexpr (std::is_member_function_pointer_v<decltype(setter)>) {
+				(object->*setter)(get_variable<value_t>(L, 3));
+			} else {
+				setter(object, get_variable<value_t>(L, 3));
+			}
+
+			return 0;
+		}
+
+		// decompose a member object pointer into its value and owner types
+		template <typename ptr_t>
+		struct member_object_traits_t;
+
+		template <typename value_t, typename class_t>
+		struct member_object_traits_t<value_t class_t::*> {
+			using value = value_t;
+			using owner = class_t;
+		};
+
+		// __get entry generated by set_current_proxy: pushes a proxy userdata referencing
+		// the member container embedded in the owner (index 1), anchored against GC
+		template <auto ptr, typename subtype_t>
+		static int property_proxy_get_proxy(lua_State* L) {
+			using traits_t = member_object_traits_t<decltype(ptr)>;
+			using owner_t = std::conditional_t<std::is_void_v<subtype_t>, typename traits_t::owner, subtype_t>;
+			using member_t = typename traits_t::value;
+
+			owner_t* object = get_variable<owner_t*>(L, 1);
+			if (object == nullptr) {
+				return syserror(L, "error.parameter", "The first parameter of a property must be a C++ instance of type %s.\n", get_lua_name<owner_t>());
+			}
+
+			return push_proxy_view_variable<proxy_view_t<member_t>>(L, &(object->*ptr), lua_absindex(L, 1));
+		}
+
+		// __set entry generated by set_current_proxy: whole-container assignment, accepting
+		// either a proxy of the same container type (view or owned clone) or a lua table
+		template <auto ptr, typename subtype_t>
+		static int property_proxy_set_proxy(lua_State* L) {
+			using traits_t = member_object_traits_t<decltype(ptr)>;
+			using owner_t = std::conditional_t<std::is_void_v<subtype_t>, typename traits_t::owner, subtype_t>;
+			using member_t = typename traits_t::value; // non-const: __set is only registered for non-const members
+
+			owner_t* object = get_variable<owner_t*>(L, 1);
+			if (object == nullptr) {
+				return syserror(L, "error.parameter", "The first parameter of a property must be a C++ instance of type %s.\n", get_lua_name<owner_t>());
+			}
+
+			member_t& member = object->*ptr;
+
+			// a.vector = b.vector / a.vector = clone
+			if (proxy_view_t<member_t>* source = get_variable<proxy_view_t<member_t>*>(L, 3)) {
+				member = *source->ptr;
+				return 0;
+			}
+
+			// a.vector = {1, 2, 3}
+			if (lua_istable(L, 3)) {
+				if constexpr (iris_is_queue<member_t>::value || iris_is_heap<member_t>::value) {
+					// queue/heap containers are not iterable: clear then push elements one by one
+					while (!member.empty()) {
+						member.pop();
+					}
+
+					size_t len = static_cast<size_t>(lua_rawlen(L, 3));
+					for (size_t i = 0; i < len; i++) {
+						lua_rawgeti(L, 3, static_cast<int>(i) + 1);
+						member.push(get_variable<typename member_t::value_type>(L, -1));
+						lua_pop(L, 1);
+					}
+				} else {
+					member = get_variable<member_t>(L, 3);
+				}
+
+				return 0;
+			}
+
+			return syserror(L, "error.parameter", "Unable to assign property, expected a proxy of %s or a lua table.\n", get_lua_name<member_t>());
+		}
+
+		// push a proxy_view_t userdata referencing a container embedded in its owner.
+		// owner_index != 0 anchors the owner lua object so it cannot be collected while
+		// the proxy lives: uservalue on 5.4+, registry ref on older versions (no uservalues).
+		template <typename proxy_t>
+		static int push_proxy_view_variable(lua_State* L, typename proxy_t::container_t* container, int owner_index) {
+			IRIS_ASSERT(container != nullptr);
+			iris_lua_t lua(L);
+
+			auto type = lua.make_registry_type<proxy_t>();
+
+			size_t size = iris_to_alignment(sizeof(proxy_t), size_mask_alignment);
+#if LUA_VERSION_NUM >= 504
+			void* userdata = lua_newuserdatauv(L, size, 1);
+#else
+			void* userdata = lua_newuserdatauv(L, size, 0);
+#endif
+			proxy_t* proxy = new (userdata) proxy_t();
+			proxy->ptr = container;
+
+			// push_variable() dereferences a rvalue ref-family object after pushing
+			push_variable(L, std::move(type));
+			IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+			lua_setmetatable(L, -2);
+
+			if (owner_index != 0) {
+#if LUA_VERSION_NUM >= 504
+				lua_pushvalue(L, owner_index);
+				lua_setiuservalue(L, -2, 1);
+#else
+				lua_pushvalue(L, owner_index);
+				proxy->owner_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+#endif
+			}
+
+			return 1;
+		}
+
+		// push an owned proxy_view_t userdata holding a copy of the container (clone),
+		// the container is stored in the userdata payload behind the proxy header
+		template <typename proxy_t>
+		static int push_proxy_owned_variable(lua_State* L, const typename proxy_t::container_t& source) {
+			using container_t = typename proxy_t::container_t;
+			static_assert(!std::is_const_v<container_t>, "Owned proxy requires a mutable container type.");
+
+			iris_lua_t lua(L);
+
+			auto type = lua.make_registry_type<proxy_t>();
+
+			size_t offset = iris_to_alignment(sizeof(proxy_t), size_mask_alignment);
+			if (offset % alignof(container_t) != 0) {
+				offset = iris_to_alignment(offset, alignof(container_t));
+			}
+			size_t size = iris_to_alignment(offset + sizeof(container_t), size_mask_alignment);
+
+			void* userdata = lua_newuserdatauv(L, size, 0);
+			proxy_t* proxy = new (userdata) proxy_t();
+			proxy->ptr = new (reinterpret_cast<char*>(userdata) + offset) container_t(source);
+			proxy->owned = true;
+
+			push_variable(L, std::move(type));
+			IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+			lua_setmetatable(L, -2);
+
+			return 1;
 		}
 
 		// push variables from a tuple into a lua table
@@ -3812,7 +4362,7 @@ namespace iris {
 								lua_pop(T, 1);
 
 								if (ptr != nullptr) {
-									reinterpret_cast<decltype(&view_construct_stub<void*>)>(ptr)(T, L, index, rawlen);
+									reinterpret_cast<decltype(&view_construct_stub<void*>)>(ptr)(T, L, absindex, rawlen);
 								} else {
 									lua_pushnil(T);
 								}
@@ -3921,5 +4471,584 @@ namespace iris {
 
 	protected:
 		lua_State* state = nullptr;
+	};
+
+	// reference proxy over a container embedded in a registered object.
+	// - view form (set_current_proxy): ptr references the owner's member in place,
+	//   a.vector[i] = 5 writes through to the original container, no read-modify-write;
+	// - owned form (clone): ptr references a copy stored in the userdata payload.
+	// methods live in the metatable only (getmetatable(p).push_back(p, v)) so data keys
+	// are never shadowed by library names; __index/__newindex do pure data-key dispatch.
+	// iteration is snapshot-based (keys/values/items) to sidestep iterator invalidation,
+	// sequences can also use plain 'for i = 1, #p do p[i] end'.
+	// proxies are per-VM transient views: not copyable, not transferable.
+	template <typename container_type>
+	struct proxy_view_t {
+		using container_t = container_type; // may be const for read-only views
+		using mutable_container_t = std::remove_const_t<container_type>;
+		static constexpr bool const_view = std::is_const_v<container_type>;
+		static constexpr bool map_view = iris_is_map<mutable_container_t>::value;
+		// queue/heap faces take precedence over the iterable sequence face detection
+		// would otherwise be ambiguous: they are disjoint container shapes (no operator[],
+		// no begin/end for std::queue/priority_queue), checked before the sequence branch.
+		static constexpr bool queue_view = !map_view && iris_is_queue<mutable_container_t>::value;
+		static constexpr bool heap_view = !map_view && !queue_view && iris_is_heap<mutable_container_t>::value;
+		static constexpr bool sequence_view = !map_view && !queue_view && !heap_view;
+
+		container_t* ptr = nullptr;
+		bool owned = false;
+#if LUA_VERSION_NUM < 504
+		int owner_ref = LUA_NOREF; // registry ref anchoring the owner (no uservalues before 5.4)
+#endif
+
+		proxy_view_t() = default;
+		proxy_view_t(const proxy_view_t&) = delete; // prevent accidental payload aliasing
+		proxy_view_t& operator = (const proxy_view_t&) = delete;
+
+		static proxy_view_t* get_self(lua_State* L) {
+			return iris_lua_t::get_variable<proxy_view_t*>(L, 1);
+		}
+
+		static int lua_self_error(lua_State* L) {
+			return iris_lua_t::syserror(L, "error.parameter", "The first parameter must be a proxy of %s.\n", iris_lua_t::get_lua_name<proxy_view_t>());
+		}
+
+		// called by __gc (delete_object) before destructing the trivial header
+		static void lua_finalize(iris_lua_t lua, int index, proxy_view_t* self) {
+			if (self->owned) {
+				const_cast<mutable_container_t*>(self->ptr)->~mutable_container_t();
+			}
+
+#if LUA_VERSION_NUM < 504
+			if (self->owner_ref != LUA_NOREF) {
+				luaL_unref(lua, LUA_REGISTRYINDEX, self->owner_ref);
+				self->owner_ref = LUA_NOREF;
+			}
+#endif
+		}
+
+		// ---- metamethods ----
+
+		static int lua_len(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			iris_lua_t::push_variable(L, self->ptr->size());
+			return 1;
+		}
+
+		static int lua_index(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (map_view) {
+				using key_t = typename mutable_container_t::key_type;
+				if (!iris_lua_t::check_required_parameters<key_t>(L, 0, 0, false, 2, true)) {
+					lua_pushnil(L); // non-matching key type simply misses
+					return 1;
+				}
+
+				key_t key = iris_lua_t::get_variable<key_t>(L, 2);
+				auto it = self->ptr->find(key);
+				if (it == self->ptr->end()) {
+					lua_pushnil(L);
+				} else {
+					iris_lua_t::push_variable(L, it->second);
+				}
+
+				return 1;
+			} else if constexpr (queue_view || heap_view) {
+				// queue/heap faces have no random access data keys at all
+				lua_pushnil(L);
+				return 1;
+			} else {
+				if (lua_type(L, 2) != LUA_TNUMBER) {
+					lua_pushnil(L); // sequences only have integer data keys, anything else misses
+					return 1;
+				}
+
+				lua_Integer size = static_cast<lua_Integer>(self->ptr->size());
+				lua_Integer index = lua_tointeger(L, 2);
+				if (index < 0) {
+					index += size + 1; // t[-1] is the last element
+				}
+
+				if (index < 1 || index > size) {
+					return iris_lua_t::syserror(L, "error.parameter", "Sequence proxy index %d out of range [1, %d].\n", static_cast<int>(lua_tointeger(L, 2)), static_cast<int>(size));
+				}
+
+				iris_lua_t::push_variable(L, (*self->ptr)[static_cast<size_t>(index - 1)]);
+				return 1;
+			}
+		}
+
+		static int lua_newindex(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (const_view) {
+				return iris_lua_t::syserror(L, "error.exec", "Cannot modify a const proxy of %s.\n", iris_lua_t::get_lua_name<proxy_view_t>());
+			} else if constexpr (queue_view || heap_view) {
+				// queue/heap faces have no element assignment path, push()/pop() only
+				return iris_lua_t::syserror(L, "error.exec", "Queue/heap proxies do not support element assignment, use push()/pop() instead.\n");
+			} else if constexpr (map_view) {
+				using key_t = typename mutable_container_t::key_type;
+				using mapped_t = typename mutable_container_t::mapped_type;
+				if (!iris_lua_t::check_required_parameters<key_t>(L, 0, 0, false, 2, true) || !iris_lua_t::check_required_parameters<mapped_t>(L, 0, 0, false, 3, true)) {
+					return iris_lua_t::syserror(L, "error.parameter", "Map proxy expects a valid key and value.\n");
+				}
+
+				(*self->ptr)[iris_lua_t::get_variable<key_t>(L, 2)] = iris_lua_t::get_variable<mapped_t>(L, 3);
+				return 0;
+			} else {
+				using value_t = typename mutable_container_t::value_type;
+				if (lua_type(L, 2) != LUA_TNUMBER) {
+					return iris_lua_t::syserror(L, "error.parameter", "Sequence proxy expects an integer index.\n");
+				}
+				if (!iris_lua_t::check_required_parameters<value_t>(L, 0, 0, false, 3, true)) {
+					return iris_lua_t::syserror(L, "error.parameter", "Sequence proxy expects a valid element value.\n");
+				}
+
+				lua_Integer size = static_cast<lua_Integer>(self->ptr->size());
+				lua_Integer index = lua_tointeger(L, 2);
+				if (index < 0) {
+					index += size + 1; // t[-1] is the last element
+				}
+
+				if (index < 1 || index > size) {
+					return iris_lua_t::syserror(L, "error.parameter", "Sequence proxy index %d out of range [1, %d].\n", static_cast<int>(lua_tointeger(L, 2)), static_cast<int>(size));
+				}
+
+				(*self->ptr)[static_cast<size_t>(index - 1)] = iris_lua_t::get_variable<value_t>(L, 3);
+				return 0;
+			}
+		}
+
+		// ---- shared methods ----
+
+		static int lua_size(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			iris_lua_t::push_variable(L, self->ptr->size());
+			return 1;
+		}
+
+		static int lua_empty(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			iris_lua_t::push_variable(L, self->ptr->empty());
+			return 1;
+		}
+
+		static int lua_clear(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (queue_view || heap_view) {
+				// std::queue/std::priority_queue lack clear(): drain instead
+				while (!self->ptr->empty()) {
+					self->ptr->pop();
+				}
+			} else {
+				self->ptr->clear();
+			}
+
+			return 0;
+		}
+
+		static int lua_clone(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (std::is_copy_constructible_v<mutable_container_t>) {
+				return iris_lua_t::push_proxy_owned_variable<proxy_view_t<mutable_container_t>>(L, *self->ptr);
+			} else {
+				// move-only containers (e.g. iris_queue_list_t) cannot be cloned,
+				// the clone entry is not registered in lua_registar either
+				return lua_self_error(L);
+			}
+		}
+
+		// ---- queue/heap methods ----
+
+		static int lua_front(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (queue_view) {
+				if (self->ptr->empty()) {
+					return iris_lua_t::syserror(L, "error.exec", "front() on an empty queue.\n");
+				}
+
+				iris_lua_t::push_variable(L, self->ptr->front());
+				return 1;
+			} else {
+				return lua_self_error(L);
+			}
+		}
+
+		static int lua_back(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (queue_view && iris_is_backable<mutable_container_t>::value) {
+				if (self->ptr->empty()) {
+					return iris_lua_t::syserror(L, "error.exec", "back() on an empty queue.\n");
+				}
+
+				iris_lua_t::push_variable(L, self->ptr->back());
+				return 1;
+			} else {
+				return lua_self_error(L);
+			}
+		}
+
+		static int lua_top(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (heap_view) {
+				if (self->ptr->empty()) {
+					return iris_lua_t::syserror(L, "error.exec", "top() on an empty heap.\n");
+				}
+
+				iris_lua_t::push_variable(L, self->ptr->top());
+				return 1;
+			} else {
+				return lua_self_error(L);
+			}
+		}
+
+		static int lua_push(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (queue_view || heap_view) {
+				using value_t = typename mutable_container_t::value_type;
+				if (!iris_lua_t::check_required_parameters<value_t>(L, 0, 0, false, 2, true)) {
+					return iris_lua_t::syserror(L, "error.parameter", "push() expects a valid element value.\n");
+				}
+
+				self->ptr->push(iris_lua_t::get_variable<value_t>(L, 2));
+				return 0;
+			} else {
+				return lua_self_error(L);
+			}
+		}
+
+		static int lua_queue_pop(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (queue_view || heap_view) {
+				if (self->ptr->empty()) {
+					return iris_lua_t::syserror(L, "error.exec", "pop() on an empty queue/heap.\n");
+				}
+
+				self->ptr->pop();
+				return 0;
+			} else {
+				return lua_self_error(L);
+			}
+		}
+
+		// ---- sequence methods ----
+
+		static int lua_at(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (!map_view) {
+				lua_Integer size = static_cast<lua_Integer>(self->ptr->size());
+				if (lua_type(L, 2) != LUA_TNUMBER) {
+					return iris_lua_t::syserror(L, "error.parameter", "Sequence proxy expects an integer index.\n");
+				}
+
+				lua_Integer index = lua_tointeger(L, 2);
+				if (index < 0) {
+					index += size + 1;
+				}
+
+				if (index < 1 || index > size) {
+					return iris_lua_t::syserror(L, "error.parameter", "Sequence proxy index %d out of range [1, %d].\n", static_cast<int>(lua_tointeger(L, 2)), static_cast<int>(size));
+				}
+
+				iris_lua_t::push_variable(L, (*self->ptr)[static_cast<size_t>(index - 1)]);
+				return 1;
+			} else {
+				return lua_self_error(L);
+			}
+		}
+
+		static int lua_resize(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if (lua_type(L, 2) != LUA_TNUMBER || lua_tointeger(L, 2) < 0) {
+				return iris_lua_t::syserror(L, "error.parameter", "resize() expects a non-negative integer.\n");
+			}
+
+			self->ptr->resize(static_cast<size_t>(lua_tointeger(L, 2)));
+			return 0;
+		}
+
+		static int lua_push_back(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			using value_t = typename mutable_container_t::value_type;
+			if (!iris_lua_t::check_required_parameters<value_t>(L, 0, 0, false, 2, true)) {
+				return iris_lua_t::syserror(L, "error.parameter", "push_back() expects a valid element value.\n");
+			}
+
+			self->ptr->push_back(iris_lua_t::get_variable<value_t>(L, 2));
+			return 0;
+		}
+
+		static int lua_pop_back(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if (self->ptr->empty()) {
+				return iris_lua_t::syserror(L, "error.exec", "pop_back() on an empty sequence.\n");
+			}
+
+			self->ptr->pop_back();
+			return 0;
+		}
+
+		static int lua_insert_value(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (map_view) {
+				using key_t = typename mutable_container_t::key_type;
+				using mapped_t = typename mutable_container_t::mapped_type;
+				if (!iris_lua_t::check_required_parameters<key_t>(L, 0, 0, false, 2, true) || !iris_lua_t::check_required_parameters<mapped_t>(L, 0, 0, false, 3, true)) {
+					return iris_lua_t::syserror(L, "error.parameter", "insert() expects a valid key and value.\n");
+				}
+
+				(*self->ptr)[iris_lua_t::get_variable<key_t>(L, 2)] = iris_lua_t::get_variable<mapped_t>(L, 3);
+				return 0;
+			} else {
+				using value_t = typename mutable_container_t::value_type;
+				lua_Integer size = static_cast<lua_Integer>(self->ptr->size());
+				if (lua_type(L, 2) != LUA_TNUMBER) {
+					return iris_lua_t::syserror(L, "error.parameter", "insert() expects an integer index.\n");
+				}
+				if (!iris_lua_t::check_required_parameters<value_t>(L, 0, 0, false, 3, true)) {
+					return iris_lua_t::syserror(L, "error.parameter", "insert() expects a valid element value.\n");
+				}
+
+				lua_Integer index = lua_tointeger(L, 2);
+				if (index < 0) {
+					index += size + 1;
+				}
+
+				if (index < 1 || index > size + 1) {
+					return iris_lua_t::syserror(L, "error.parameter", "insert() index %d out of range [1, %d].\n", static_cast<int>(lua_tointeger(L, 2)), static_cast<int>(size + 1));
+				}
+
+				self->ptr->insert(self->ptr->begin() + static_cast<size_t>(index - 1), iris_lua_t::get_variable<value_t>(L, 3));
+				return 0;
+			}
+		}
+
+		static int lua_erase(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (map_view) {
+				using key_t = typename mutable_container_t::key_type;
+				if (!iris_lua_t::check_required_parameters<key_t>(L, 0, 0, false, 2, true)) {
+					return iris_lua_t::syserror(L, "error.parameter", "erase() expects a valid key.\n");
+				}
+
+				self->ptr->erase(iris_lua_t::get_variable<key_t>(L, 2));
+				return 0;
+			} else {
+				lua_Integer size = static_cast<lua_Integer>(self->ptr->size());
+				if (lua_type(L, 2) != LUA_TNUMBER) {
+					return iris_lua_t::syserror(L, "error.parameter", "erase() expects an integer index.\n");
+				}
+
+				lua_Integer index = lua_tointeger(L, 2);
+				if (index < 0) {
+					index += size + 1;
+				}
+
+				if (index < 1 || index > size) {
+					return iris_lua_t::syserror(L, "error.parameter", "erase() index %d out of range [1, %d].\n", static_cast<int>(lua_tointeger(L, 2)), static_cast<int>(size));
+				}
+
+				self->ptr->erase(self->ptr->begin() + static_cast<size_t>(index - 1));
+				return 0;
+			}
+		}
+
+		// ---- map methods ----
+
+		static int lua_count(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			using key_t = typename mutable_container_t::key_type;
+			if (!iris_lua_t::check_required_parameters<key_t>(L, 0, 0, false, 2, true)) {
+				return iris_lua_t::syserror(L, "error.parameter", "count() expects a valid key.\n");
+			}
+
+			iris_lua_t::push_variable(L, self->ptr->count(iris_lua_t::get_variable<key_t>(L, 2)));
+			return 1;
+		}
+
+		static int lua_keys(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			lua_newtable(L);
+			int i = 0;
+			for (auto&& pair : *self->ptr) {
+				iris_lua_t::push_variable(L, pair.first);
+				lua_rawseti(L, -2, ++i);
+			}
+
+			return 1;
+		}
+
+		static int lua_values(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			lua_newtable(L);
+			int i = 0;
+			for (auto&& pair : *self->ptr) {
+				iris_lua_t::push_variable(L, pair.second);
+				lua_rawseti(L, -2, ++i);
+			}
+
+			return 1;
+		}
+
+		static int lua_items(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			lua_newtable(L);
+			int i = 0;
+			for (auto&& pair : *self->ptr) {
+				lua_createtable(L, 2, 0);
+				iris_lua_t::push_variable(L, pair.first);
+				lua_rawseti(L, -2, 1);
+				iris_lua_t::push_variable(L, pair.second);
+				lua_rawseti(L, -2, 2);
+				lua_rawseti(L, -2, ++i);
+			}
+
+			return 1;
+		}
+
+		// ---- registration ----
+
+		template <typename traits_t>
+		static void lua_registar(iris_lua_t lua, traits_t) {
+			lua.set_current<&proxy_view_t::lua_len>("__len");
+			lua.set_current<&proxy_view_t::lua_index>("__index");
+			// always override the default __newindex installed by make_type: const views
+			// must report an error instead of silently dropping the assignment
+			lua.set_current<&proxy_view_t::lua_newindex>("__newindex");
+
+			// methods are only reachable through the metatable: getmetatable(p).push_back(p, v)
+			lua.set_current<&proxy_view_t::lua_size>("size");
+			lua.set_current<&proxy_view_t::lua_empty>("empty");
+			if constexpr (std::is_copy_constructible_v<mutable_container_t>) {
+				lua.set_current<&proxy_view_t::lua_clone>("clone");
+			}
+
+			if constexpr (map_view) {
+				lua.set_current<&proxy_view_t::lua_count>("count");
+				lua.set_current<&proxy_view_t::lua_keys>("keys");
+				lua.set_current<&proxy_view_t::lua_values>("values");
+				lua.set_current<&proxy_view_t::lua_items>("items");
+				if constexpr (!const_view) {
+					lua.set_current<&proxy_view_t::lua_insert_value>("insert");
+					lua.set_current<&proxy_view_t::lua_erase>("erase");
+					lua.set_current<&proxy_view_t::lua_clear>("clear");
+				}
+				} else if constexpr (queue_view) {
+				lua.set_current<&proxy_view_t::lua_front>("front");
+				if constexpr (iris_is_backable<mutable_container_t>::value) {
+					lua.set_current<&proxy_view_t::lua_back>("back");
+				}
+
+				if constexpr (!const_view) {
+					lua.set_current<&proxy_view_t::lua_push>("push");
+					lua.set_current<&proxy_view_t::lua_queue_pop>("pop");
+					lua.set_current<&proxy_view_t::lua_clear>("clear");
+				}
+			} else if constexpr (heap_view) {
+				lua.set_current<&proxy_view_t::lua_top>("top");
+				if constexpr (!const_view) {
+					lua.set_current<&proxy_view_t::lua_push>("push");
+					lua.set_current<&proxy_view_t::lua_queue_pop>("pop");
+					lua.set_current<&proxy_view_t::lua_clear>("clear");
+				}
+			} else {
+				lua.set_current<&proxy_view_t::lua_at>("at");
+				if constexpr (!const_view) {
+					lua.set_current<&proxy_view_t::lua_insert_value>("insert");
+					lua.set_current<&proxy_view_t::lua_erase>("erase");
+					lua.set_current<&proxy_view_t::lua_clear>("clear");
+					lua.set_current<&proxy_view_t::lua_resize>("resize");
+					lua.set_current<&proxy_view_t::lua_push_back>("push_back");
+					lua.set_current<&proxy_view_t::lua_pop_back>("pop_back");
+				}
+			}
+		}
 	};
 }
